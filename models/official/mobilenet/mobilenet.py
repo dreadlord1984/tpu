@@ -23,70 +23,54 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import functools
+
 import os
+from absl import app
 from absl import flags
 import tensorflow as tf
 
-import inception_preprocessing
+import supervised_images
+from hyperparameters import common_hparams_flags
+from hyperparameters import common_tpu_flags
+from hyperparameters import flags_to_params
+from hyperparameters import params_dict
 import mobilenet_model as mobilenet_v1
-import vgg_preprocessing
+from configs import mobilenet_config
 
 from tensorflow.contrib.framework.python.ops import arg_scope
-from tensorflow.contrib.tpu.python.tpu import tpu_config
-from tensorflow.contrib.tpu.python.tpu import tpu_estimator
-from tensorflow.contrib.tpu.python.tpu import tpu_optimizer
 from tensorflow.contrib.training.python.training import evaluation
 
+common_tpu_flags.define_common_tpu_flags()
+common_hparams_flags.define_common_hparams_flags()
 
-# Cloud TPU Cluster Resolvers
+# Model specific parameters
 flags.DEFINE_string(
-    'tpu', default=None,
-    help='The Cloud TPU to use for training. This should be either the name '
-    'used when creating the Cloud TPU, or a grpc://ip.address.of.tpu:8470 url.')
-flags.DEFINE_string(
-    'gcp_project', default=None,
-    help='Project name for the Cloud TPU-enabled project. If not specified, we '
-    'will attempt to automatically detect the GCE project from metadata.')
-flags.DEFINE_string(
-    'tpu_zone', default=None,
-    help='GCE zone where the Cloud TPU is located in. If not specified, we '
-    'will attempt to automatically detect the GCE project from metadata.')
-
-# Model specific paramenters
-flags.DEFINE_string(
-    'data_dir', '',
-    'Directory where input data is stored')
+    'tflite_export_dir',
+    default=None,
+    help=('The directory where the exported tflite files will be stored.'))
 
 flags.DEFINE_string(
-    'model_dir', None,
-    'Directory where model output is stored')
+    'export_dir',
+    default=None,
+    help=('The directory where the exported SavedModel will be stored.'))
 
 flags.DEFINE_integer(
-    'num_shards', 8,
+    'num_train_images', default=None, help='Size of training data set.')
+
+flags.DEFINE_integer(
+    'num_eval_images', default=None, help='Size of evaluation data set.')
+
+flags.DEFINE_integer(
+    'num_cores', None,
     'Number of shards (workers).')
 
 flags.DEFINE_integer(
-    'iterations', 100,
-    'Number of iterations per TPU training loop.')
-
-flags.DEFINE_integer(
-    'train_batch_size', 1024,
-    'Global (not per-shard) batch size for training')
-
-flags.DEFINE_integer(
-    'eval_total_size', 0,
+    'eval_total_size', None,
     'Total batch size for evaluation, use the entire validation set if 0')
 
 flags.DEFINE_integer(
-    'eval_batch_size', 1024,
-    'Global (not per-shard) batch size for evaluation')
-
-flags.DEFINE_integer(
-    'train_steps', 8000000,
-    'Number of steps use for training.')
-
-flags.DEFINE_integer(
-    'train_steps_per_eval', 2000,
+    'train_steps_per_eval', None,
     'Number of training steps to run between evaluations.')
 
 flags.DEFINE_string(
@@ -94,17 +78,13 @@ flags.DEFINE_string(
     'Mode to run: train, eval, train_and_eval')
 
 flags.DEFINE_integer(
-    'min_eval_interval', 180,
+    'min_eval_interval', None,
     'Minimum number of seconds between evaluations')
 
 flags.DEFINE_integer(
     'eval_timeout', None,
     'Evaluation timeout: Maximum number of seconds that '
     'may elapse while no new checkpoints are observed')
-
-flags.DEFINE_bool(
-    'use_tpu', True,
-    'Use TPUs rather than plain CPUs')
 
 flags.DEFINE_boolean(
     'per_host_input_for_training', True,
@@ -115,35 +95,23 @@ flags.DEFINE_string(
     'One of "fake","real"')
 
 flags.DEFINE_float(
-    'learning_rate', 0.165,
+    'learning_rate', None,
     'Learning rate.')
 
 flags.DEFINE_float(
-    'depth_multiplier', 1.0,
+    'depth_multiplier', None,
     'Depth Multiplier on Inception')
 
 flags.DEFINE_string(
-    'optimizer', 'RMS',
+    'optimizer', None,
     'Optimizer (one of sgd, RMS, momentum)')
 
 flags.DEFINE_integer(
-    'num_classes', 1001,
+    'num_classes', None,
     'Number of classes to distinguish')
 
-flags.DEFINE_integer(
-    'width', 224,
-    'Width of input image')
-
-flags.DEFINE_integer(
-    'height', 224,
-    'Height of input image')
-
 flags.DEFINE_bool(
-    'transpose_enabled', False,
-    'Boolean to enable/disable explicit I/O transpose')
-
-flags.DEFINE_bool(
-    'use_fused_batchnorm', True,
+    'use_fused_batchnorm', None,
     'Enable fused batchrnom')
 
 flags.DEFINE_bool(
@@ -160,28 +128,19 @@ flags.DEFINE_integer(
     'should be checkpointed. Set to 0 to disable.')
 
 flags.DEFINE_bool(
-    'moving_average', True,
+    'moving_average', None,
     'Whether to enable moving average computation on variables')
 
-flags.DEFINE_string(
-    'preprocessing', 'inception',
-    'Preprocessing stage to use: one of inception or vgg')
-
-flags.DEFINE_bool(
-    'use_annotated_bbox', False,
-    'If true, use annotated bounding box as input to cropping function, '
-    'else use full image size')
-
 flags.DEFINE_float(
-    'learning_rate_decay', 0.94,
+    'learning_rate_decay', None,
     'Exponential decay rate used in learning rate adjustment')
 
 flags.DEFINE_integer(
-    'learning_rate_decay_epochs', 3,
+    'learning_rate_decay_epochs', None,
     'Exponential decay epochs used in learning rate adjustment')
 
 flags.DEFINE_bool(
-    'use_logits', True,
+    'use_logits', None,
     'Use logits if true, else use predictions')
 
 flags.DEFINE_bool(
@@ -189,44 +148,21 @@ flags.DEFINE_bool(
     'Whether to dump prediction tensors for comparison')
 
 flags.DEFINE_bool(
-    'clear_update_collections', True,
+    'clear_update_collections', None,
     'Set batchnorm update_collections to None if true, else use default value')
 
-# Dataset specific paramenters
 flags.DEFINE_bool(
-    'prefetch_enabled', True,
-    'Boolean to enable/disable prefetching')
+    'transpose_enabled', None,
+    'Boolean to enable/disable explicit I/O transpose')
 
 flags.DEFINE_integer(
-    'prefetch_dataset_buffer_size', 8*1024*1024,
-    'Number of bytes in read buffer. 0 means no buffering.')
+    'serving_image_size', None,
+    'image height/width for serving input tensor.')
 
-flags.DEFINE_integer(
-    'num_files_infeed', 8,
-    'Number of training files to read in parallel.')
-
-flags.DEFINE_integer(
-    'num_parallel_calls', 64,
-    'Number of elements to process in parallel (by mapper)')
-
-flags.DEFINE_integer(
-    'initial_shuffle_buffer_size', 1024,
-    'Number of elements from dataset that shuffler will sample from. '
-    'This shuffling is done before any other operations. '
-    'Set to 0 to disable')
-
-flags.DEFINE_integer(
-    'followup_shuffle_buffer_size', 1000,
-    'Number of elements from dataset that shuffler will sample from. '
-    'This shuffling is done after prefetching is done. '
-    'Set to 0 to disable')
-
+flags.DEFINE_bool('post_quantize', None,
+                  'Whether to export quantized tflite file.')
 
 FLAGS = flags.FLAGS
-
-# Dataset constants
-_NUM_TRAIN_IMAGES = 1281167
-_NUM_EVAL_IMAGES = 50000
 
 # Random cropping constants
 _RESIZE_SIDE_MIN = 256
@@ -245,202 +181,74 @@ BATCH_NORM_DECAY = 0.996
 BATCH_NORM_EPSILON = 1e-3
 
 
-class InputPipeline(object):
-  """Generates ImageNet input_fn for training or evaluation.
+def image_serving_input_fn():
+  """Serving input fn for raw images.
 
-  The training data is assumed to be in TFRecord format with keys as specified
-  in the dataset_parser below, sharded across 1024 files, named sequentially:
-      train-00000-of-01024
-      train-00001-of-01024
-      ...
-      train-01023-of-01024
-
-  The validation data is in the same format but sharded in 128 files.
-
-  The fortmat of the data required is created by the script at:
-      https://github.com/tensorflow/tpu/blob/master/tools/datasets/imagenet_to_gcs.py
-
-  Args:
-    is_training: `bool` for whether the input is for training
-  """
-
-  def __init__(self, is_training, data_dir):
-    self.is_training = is_training
-    self.data_dir = data_dir
-
-  def dataset_parser(self, serialized_proto):
-    """Parse an Imagenet record from value."""
-    keys_to_features = {
-        'image/encoded':
-            tf.FixedLenFeature((), tf.string, default_value=''),
-        'image/format':
-            tf.FixedLenFeature((), tf.string, default_value='jpeg'),
-        'image/class/label':
-            tf.FixedLenFeature([], dtype=tf.int64, default_value=-1),
-        'image/class/text':
-            tf.FixedLenFeature([], dtype=tf.string, default_value=''),
-        'image/object/bbox/xmin':
-            tf.VarLenFeature(dtype=tf.float32),
-        'image/object/bbox/ymin':
-            tf.VarLenFeature(dtype=tf.float32),
-        'image/object/bbox/xmax':
-            tf.VarLenFeature(dtype=tf.float32),
-        'image/object/bbox/ymax':
-            tf.VarLenFeature(dtype=tf.float32),
-        'image/object/class/label':
-            tf.VarLenFeature(dtype=tf.int64),
-    }
-
-    features = tf.parse_single_example(serialized_proto, keys_to_features)
-
-    bbox = None
-    if FLAGS.use_annotated_bbox:
-      xmin = tf.expand_dims(features['image/object/bbox/xmin'].values, 0)
-      ymin = tf.expand_dims(features['image/object/bbox/ymin'].values, 0)
-      xmax = tf.expand_dims(features['image/object/bbox/xmax'].values, 0)
-      ymax = tf.expand_dims(features['image/object/bbox/ymax'].values, 0)
-
-      # Note that we impose an ordering of (y, x) just to make life difficult.
-      bbox = tf.concat([ymin, xmin, ymax, xmax], 0)
-
-      # Force the variable number of bounding boxes into the shape
-      # [1, num_boxes, coords].
-      bbox = tf.expand_dims(bbox, 0)
-      bbox = tf.transpose(bbox, [0, 2, 1])
-
-    image = features['image/encoded']
-    image = tf.image.decode_jpeg(image, channels=3)
-    image = tf.image.convert_image_dtype(image, dtype=tf.float32)
-
-    if FLAGS.preprocessing == 'vgg':
-      image = vgg_preprocessing.preprocess_image(
-          image=image,
-          output_height=FLAGS.height,
-          output_width=FLAGS.width,
-          is_training=self.is_training,
-          resize_side_min=_RESIZE_SIDE_MIN,
-          resize_side_max=_RESIZE_SIDE_MAX)
-    elif FLAGS.preprocessing == 'inception':
-      image = inception_preprocessing.preprocess_image(
-          image=image,
-          output_height=FLAGS.height,
-          output_width=FLAGS.width,
-          is_training=self.is_training,
-          bbox=bbox)
-    else:
-      assert False, 'Unknown preprocessing type: %s' % FLAGS.preprocessing
-
-    label = tf.cast(
-        tf.reshape(features['image/class/label'], shape=[]), dtype=tf.int32)
-
-    return image, label
-
-  def input_fn(self, params):
-    """Input function which provides a single batch for train or eval.
-
-    Args:
-      params: `dict` of parameters passed from the `TPUEstimator`.
-          `params['batch_size']` is always provided and should be used as the
-          effective batch size.
-
-    Returns:
-      A (images, labels) tuple of `Tensor`s for a batch of samples.
-    """
-    batch_size = params['batch_size']
-
-    if FLAGS.use_data == 'real':
-      file_pattern = os.path.join(
-          self.data_dir, 'train-*' if self.is_training else 'validation-*')
-      dataset = tf.data.Dataset.list_files(file_pattern,
-                                           shuffle=self.is_training)
-
-      if self.is_training:
-        dataset = dataset.repeat()
-
-      def prefetch_dataset(filename):
-        dataset = tf.data.TFRecordDataset(
-            filename, buffer_size=FLAGS.prefetch_dataset_buffer_size)
-        return dataset
-
-      dataset = dataset.apply(
-          tf.contrib.data.parallel_interleave(
-              prefetch_dataset,
-              cycle_length=FLAGS.num_files_infeed,
-              sloppy=True))
-
-      if FLAGS.followup_shuffle_buffer_size > 0:
-        dataset = dataset.shuffle(
-            buffer_size=FLAGS.followup_shuffle_buffer_size)
-
-      dataset = dataset.map(
-          self.dataset_parser,
-          num_parallel_calls=FLAGS.num_parallel_calls)
-
-      dataset = dataset.prefetch(batch_size)
-
-      dataset = dataset.apply(
-          tf.contrib.data.batch_and_drop_remainder(batch_size))
-
-      dataset = dataset.prefetch(2)  # Prefetch overlaps in-feed with training
-
-      images, labels = dataset.make_one_shot_iterator().get_next()
-      images.set_shape([batch_size, FLAGS.height, FLAGS.width, 3])
-    else:
-      images = tf.random_uniform(
-          [batch_size, FLAGS.height, FLAGS.width, 3], minval=-1, maxval=1)
-      labels = tf.random_uniform(
-          [batch_size], minval=0, maxval=999, dtype=tf.int32)
-
-    images = tensor_transform_fn(images, params['output_perm'])
-    return images, labels
-
-
-def tensor_transform_fn(data, perm):
-  """Transpose function.
-
-  This function is used to transpose an image tensor on the host and then
-  perform an inverse transpose on the TPU. The transpose on the TPU gets
-  effectively elided thus voiding any associated computational cost.
-
-  NOTE: Eventually the compiler will be able to detect when this kind of
-  operation may prove beneficial and perform these types of transformations
-  implicitly, voiding the need for user intervention
-
-  Args:
-    data: Tensor to be transposed
-    perm: Permutation of the dimensions of a
+  This function is consumed when exporting a SavedModel.
 
   Returns:
-    Transposed tensor
+    A ServingInputReceiver capable of serving MobileNet predictions.
   """
-  if FLAGS.transpose_enabled:
-    return tf.transpose(data, perm)
-  return data
+
+  image_bytes_list = tf.placeholder(
+      shape=[None],
+      dtype=tf.string,
+  )
+  images = tf.map_fn(
+      supervised_images.preprocess_raw_bytes, image_bytes_list,
+      back_prop=False, dtype=tf.float32)
+  return tf.estimator.export.ServingInputReceiver(
+      images, {'image_bytes': image_bytes_list})
+
+
+def tensor_serving_input_fn(params):
+  """Serving input fn for decoded Tensors.
+
+  This function is consumed when exporting a SavedModel.
+
+  Args:
+    params: The generated params dict
+
+  Returns:
+    A ServingInputReceiver capable of serving MobileNet predictions.
+  """
+
+  input_placeholder = tf.placeholder(
+      shape=[None, params['serving_image_size'],
+             params['serving_image_size'], 3],
+      dtype=tf.float32,
+  )
+  return tf.estimator.export.TensorServingInputReceiver(
+      features=input_placeholder, receiver_tensors=input_placeholder)
 
 
 def model_fn(features, labels, mode, params):
   """Mobilenet v1 model using Estimator API."""
-  num_classes = FLAGS.num_classes
+  num_classes = params['num_classes']
   training_active = (mode == tf.estimator.ModeKeys.TRAIN)
   eval_active = (mode == tf.estimator.ModeKeys.EVAL)
 
-  features = tensor_transform_fn(features, params['input_perm'])
+  if isinstance(features, dict):
+    features = features['feature']
 
-  if FLAGS.clear_update_collections:
+  features = supervised_images.tensor_transform_fn(
+      features, params['input_perm'])
+
+  if params['clear_update_collections']:
     # updates_collections must be set to None in order to use fused batchnorm
     with arg_scope(mobilenet_v1.mobilenet_v1_arg_scope()):
       logits, end_points = mobilenet_v1.mobilenet_v1(
           features,
           num_classes,
           is_training=training_active,
-          depth_multiplier=FLAGS.depth_multiplier)
+          depth_multiplier=params['depth_multiplier'])
   else:
     with arg_scope(mobilenet_v1.mobilenet_v1_arg_scope()):
       logits, end_points = mobilenet_v1.mobilenet_v1(
           features,
           num_classes,
           is_training=training_active,
-          depth_multiplier=FLAGS.depth_multiplier)
+          depth_multiplier=params['depth_multiplier'])
 
   predictions = {
       'classes': tf.argmax(input=logits, axis=1),
@@ -448,20 +256,26 @@ def model_fn(features, labels, mode, params):
   }
 
   if mode == tf.estimator.ModeKeys.PREDICT:
-    return tf.estimator.EstimatorSpec(mode=mode, predictions=predictions)
+    return tf.estimator.EstimatorSpec(
+        mode=mode,
+        predictions=predictions,
+        export_outputs={
+            'classify': tf.estimator.export.PredictOutput(predictions)
+        })
 
   if mode == tf.estimator.ModeKeys.EVAL and FLAGS.display_tensors and (
-      not FLAGS.use_tpu):
+      not params['use_tpu']):
     with tf.control_dependencies([
         tf.Print(
             predictions['classes'], [predictions['classes']],
-            summarize=FLAGS.eval_batch_size,
+            summarize=params['eval_batch_size'],
             message='prediction: ')
     ]):
       labels = tf.Print(
-          labels, [labels], summarize=FLAGS.eval_batch_size, message='label: ')
+          labels, [labels],
+          summarize=params['eval_batch_size'], message='label: ')
 
-  one_hot_labels = tf.one_hot(labels, FLAGS.num_classes, dtype=tf.int32)
+  one_hot_labels = tf.one_hot(labels, params['num_classes'], dtype=tf.int32)
 
   tf.losses.softmax_cross_entropy(
       onehot_labels=one_hot_labels,
@@ -470,34 +284,34 @@ def model_fn(features, labels, mode, params):
       label_smoothing=0.1)
   loss = tf.losses.get_total_loss(add_regularization_losses=True)
 
-  initial_learning_rate = FLAGS.learning_rate * FLAGS.train_batch_size / 256
+  initial_learning_rate = params['learning_rate'] * params['train_batch_size'] / 256   # pylint: disable=line-too-long
   final_learning_rate = 0.0001 * initial_learning_rate
 
   train_op = None
   if training_active:
-    batches_per_epoch = _NUM_TRAIN_IMAGES // FLAGS.train_batch_size
+    batches_per_epoch = params['num_train_images'] // params['train_batch_size']
     global_step = tf.train.get_or_create_global_step()
 
     learning_rate = tf.train.exponential_decay(
         learning_rate=initial_learning_rate,
         global_step=global_step,
-        decay_steps=FLAGS.learning_rate_decay_epochs * batches_per_epoch,
-        decay_rate=FLAGS.learning_rate_decay,
+        decay_steps=params['learning_rate_decay_epochs'] * batches_per_epoch,
+        decay_rate=params['learning_rate_decay'],
         staircase=True)
 
     # Set a minimum boundary for the learning rate.
     learning_rate = tf.maximum(
         learning_rate, final_learning_rate, name='learning_rate')
 
-    if FLAGS.optimizer == 'sgd':
+    if params['optimizer'] == 'sgd':
       tf.logging.info('Using SGD optimizer')
       optimizer = tf.train.GradientDescentOptimizer(
           learning_rate=learning_rate)
-    elif FLAGS.optimizer == 'momentum':
+    elif params['optimizer'] == 'momentum':
       tf.logging.info('Using Momentum optimizer')
       optimizer = tf.train.MomentumOptimizer(
           learning_rate=learning_rate, momentum=0.9)
-    elif FLAGS.optimizer == 'RMS':
+    elif params['optimizer'] == 'RMS':
       tf.logging.info('Using RMS optimizer')
       optimizer = tf.train.RMSPropOptimizer(
           learning_rate,
@@ -505,15 +319,15 @@ def model_fn(features, labels, mode, params):
           momentum=RMSPROP_MOMENTUM,
           epsilon=RMSPROP_EPSILON)
     else:
-      tf.logging.fatal('Unknown optimizer:', FLAGS.optimizer)
+      tf.logging.fatal('Unknown optimizer:', params['optimizer'])
 
-    if FLAGS.use_tpu:
-      optimizer = tpu_optimizer.CrossShardOptimizer(optimizer)
+    if params['use_tpu']:
+      optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer)
 
     update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
     with tf.control_dependencies(update_ops):
       train_op = optimizer.minimize(loss, global_step=global_step)
-    if FLAGS.moving_average:
+    if params['moving_average']:
       ema = tf.train.ExponentialMovingAverage(
           decay=MOVING_AVERAGE_DECAY, num_updates=global_step)
       variables_to_average = (tf.trainable_variables() +
@@ -528,14 +342,14 @@ def model_fn(features, labels, mode, params):
           input=predictions, axis=1))
       return {'accuracy': accuracy}
 
-    if FLAGS.use_logits:
+    if params['use_logits']:
       eval_predictions = logits
     else:
       eval_predictions = end_points['Predictions']
 
     eval_metrics = (metric_fn, [labels, eval_predictions])
 
-  return tpu_estimator.TPUEstimatorSpec(
+  return tf.contrib.tpu.TPUEstimatorSpec(
       mode=mode, loss=loss, train_op=train_op, eval_metrics=eval_metrics)
 
 
@@ -560,44 +374,61 @@ class LoadEMAHook(tf.train.SessionRunHook):
 def main(unused_argv):
   del unused_argv  # Unused
 
-  tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
-            FLAGS.tpu,
-            zone=FLAGS.tpu_zone,
-            project=FLAGS.gcp_project)
+  params = params_dict.ParamsDict({}, mobilenet_config.MOBILENET_RESTRICTIONS)
+  params = flags_to_params.override_params_from_input_flags(params, FLAGS)
+  params = params_dict.override_params_dict(
+      params, mobilenet_config.MOBILENET_CFG, is_strict=False)
+  params = params_dict.override_params_dict(
+      params, FLAGS.config_file, is_strict=True)
+  params = params_dict.override_params_dict(
+      params, FLAGS.params_override, is_strict=True)
 
-  batch_size_per_shard = FLAGS.train_batch_size // FLAGS.num_shards
-  params = {
-      'input_perm': [0, 1, 2, 3],
-      'output_perm': [0, 1, 2, 3],
-  }
+  input_perm = [0, 1, 2, 3]
+  output_perm = [0, 1, 2, 3]
 
   batch_axis = 0
-  if FLAGS.transpose_enabled:
+  batch_size_per_shard = params.train_batch_size // params.num_cores
+  if params.transpose_enabled:
     if batch_size_per_shard >= 64:
-      params['input_perm'] = [3, 0, 1, 2]
-      params['output_perm'] = [1, 2, 3, 0]
+      input_perm = [3, 0, 1, 2]
+      output_perm = [1, 2, 3, 0]
       batch_axis = 3
     else:
-      params['input_perm'] = [2, 0, 1, 3]
-      params['output_perm'] = [1, 2, 0, 3]
+      input_perm = [2, 0, 1, 3]
+      output_perm = [1, 2, 0, 3]
       batch_axis = 2
 
-  if FLAGS.eval_total_size > 0:
-    eval_size = FLAGS.eval_total_size
+  additional_params = {
+      'input_perm': input_perm,
+      'output_perm': output_perm,
+  }
+  params = params_dict.override_params_dict(
+      params, additional_params, is_strict=False)
+
+  params.validate()
+  params.lock()
+
+  tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
+      FLAGS.tpu if (FLAGS.tpu or params.use_tpu) else '',
+      zone=FLAGS.tpu_zone,
+      project=FLAGS.gcp_project)
+
+  if params.eval_total_size > 0:
+    eval_size = params.eval_total_size
   else:
-    eval_size = _NUM_EVAL_IMAGES
-  eval_steps = eval_size // FLAGS.eval_batch_size
+    eval_size = params.num_eval_images
+  eval_steps = eval_size // params.eval_batch_size
 
   iterations = (eval_steps if FLAGS.mode == 'eval' else
-                FLAGS.iterations)
+                params.iterations_per_loop)
 
   eval_batch_size = (None if FLAGS.mode == 'train' else
-                     FLAGS.eval_batch_size)
+                     params.eval_batch_size)
 
-  per_host_input_for_training = (FLAGS.num_shards <= 8 if
+  per_host_input_for_training = (params.num_cores <= 8 if
                                  FLAGS.mode == 'train' else True)
 
-  run_config = tpu_config.RunConfig(
+  run_config = tf.contrib.tpu.RunConfig(
       cluster=tpu_cluster_resolver,
       model_dir=FLAGS.model_dir,
       save_checkpoints_secs=FLAGS.save_checkpoints_secs,
@@ -605,30 +436,29 @@ def main(unused_argv):
       session_config=tf.ConfigProto(
           allow_soft_placement=True,
           log_device_placement=FLAGS.log_device_placement),
-      tpu_config=tpu_config.TPUConfig(
+      tpu_config=tf.contrib.tpu.TPUConfig(
           iterations_per_loop=iterations,
-          num_shards=FLAGS.num_shards,
           per_host_input_for_training=per_host_input_for_training))
 
-  inception_classifier = tpu_estimator.TPUEstimator(
+  inception_classifier = tf.contrib.tpu.TPUEstimator(
       model_fn=model_fn,
-      use_tpu=FLAGS.use_tpu,
+      use_tpu=params.use_tpu,
       config=run_config,
-      params=params,
-      train_batch_size=FLAGS.train_batch_size,
+      params=params.as_dict(),
+      train_batch_size=params.train_batch_size,
       eval_batch_size=eval_batch_size,
       batch_axis=(batch_axis, 0))
 
   # Input pipelines are slightly different (with regards to shuffling and
   # preprocessing) between training and evaluation.
-  imagenet_train = InputPipeline(
+  imagenet_train = supervised_images.InputPipeline(
       is_training=True,
       data_dir=FLAGS.data_dir)
-  imagenet_eval = InputPipeline(
+  imagenet_eval = supervised_images.InputPipeline(
       is_training=False,
       data_dir=FLAGS.data_dir)
 
-  if FLAGS.moving_average:
+  if params.moving_average:
     eval_hooks = [LoadEMAHook(FLAGS.model_dir)]
   else:
     eval_hooks = []
@@ -642,7 +472,7 @@ def main(unused_argv):
     def get_next_checkpoint():
       return evaluation.checkpoints_iterator(
           FLAGS.model_dir,
-          min_interval_secs=FLAGS.min_eval_interval,
+          min_interval_secs=params.min_eval_interval,
           timeout=FLAGS.eval_timeout,
           timeout_fn=terminate_eval)
 
@@ -660,10 +490,11 @@ def main(unused_argv):
         tf.logging.info('Checkpoint %s no longer exists ... skipping')
 
   elif FLAGS.mode == 'train_and_eval':
-    for cycle in range(FLAGS.train_steps // FLAGS.train_steps_per_eval):
+    for cycle in range(params.train_steps // params.train_steps_per_eval):
       tf.logging.info('Starting training cycle %d.' % cycle)
       inception_classifier.train(
-          input_fn=imagenet_train.input_fn, steps=FLAGS.train_steps_per_eval)
+          input_fn=imagenet_train.input_fn,
+          steps=params.train_steps_per_eval)
 
       tf.logging.info('Starting evaluation cycle %d .' % cycle)
       eval_results = inception_classifier.evaluate(
@@ -673,9 +504,32 @@ def main(unused_argv):
   else:
     tf.logging.info('Starting training ...')
     inception_classifier.train(
-        input_fn=imagenet_train.input_fn, steps=FLAGS.train_steps)
+        input_fn=imagenet_train.input_fn, steps=params.train_steps)
+
+  if FLAGS.export_dir:
+    tf.logging.info('Starting to export model with image input.')
+    inception_classifier.export_saved_model(
+        export_dir_base=FLAGS.export_dir,
+        serving_input_receiver_fn=image_serving_input_fn)
+
+  if FLAGS.tflite_export_dir:
+    tf.logging.info('Starting to export default TensorFlow model.')
+    savedmodel_dir = inception_classifier.export_saved_model(
+        export_dir_base=FLAGS.tflite_export_dir,
+        serving_input_receiver_fn=functools.partial(tensor_serving_input_fn, params))  # pylint: disable=line-too-long
+    tf.logging.info('Starting to export TFLite.')
+    converter = tf.lite.TFLiteConverter.from_saved_model(
+        savedmodel_dir,
+        output_arrays=['softmax_tensor'])
+    tflite_file_name = 'mobilenet.tflite'
+    if params.post_quantize:
+      converter.post_training_quantize = True
+      tflite_file_name = 'quantized_' + tflite_file_name
+    tflite_file = os.path.join(savedmodel_dir, tflite_file_name)
+    tflite_model = converter.convert()
+    tf.gfile.GFile(tflite_file, 'wb').write(tflite_model)
 
 
 if __name__ == '__main__':
   tf.logging.set_verbosity(tf.logging.INFO)
-  tf.app.run()
+  app.run(main)

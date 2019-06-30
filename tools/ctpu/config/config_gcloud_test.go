@@ -16,6 +16,7 @@
 package config
 
 import (
+	"os"
 	"path"
 	"strings"
 	"testing"
@@ -27,7 +28,7 @@ func testGcloudConfigDir(testName string) string {
 
 func TestGcloudClean(t *testing.T) {
 	cfgDir := testGcloudConfigDir("clean")
-	cfg, err := buildGcloudEnvConfig(cfgDir)
+	cfg, err := buildGcloudEnvConfig(cfgDir, true)
 	if err != nil {
 		t.Fatal(err.Error())
 	}
@@ -46,9 +47,42 @@ func TestGcloudClean(t *testing.T) {
 	}
 }
 
+func TestGcloudEnvConfigOverride(t *testing.T) {
+	cfgDir := testGcloudConfigDir("clean")
+	originalEnv, originalEnvOk := os.LookupEnv("CLOUDSDK_CONFIG")
+	defer func() {
+		// Attempt to set the original env back.
+		if originalEnvOk {
+			os.Setenv("CLOUDSDK_CONFIG", originalEnv)
+		}
+	}()
+
+	if err := os.Setenv("CLOUDSDK_CONFIG", cfgDir); err != nil {
+		t.Fatalf("Could not set the env: %#v", err)
+	}
+	cfg, err := gcloudConfig()
+
+	if err != nil {
+		t.Fatalf("Error creating config: %v", err)
+	}
+
+	if cfg.ActiveConfiguration != "ctpu9" {
+		t.Error("Active configuration: " + cfg.ActiveConfiguration)
+	}
+	if cfg.account != "saeta@google.com" {
+		t.Error("Account: " + cfg.account)
+	}
+	if cfg.Project != "ctpu9-test-project" {
+		t.Error("Project: " + cfg.Project)
+	}
+	if cfg.Zone != "us-central1-c" {
+		t.Error("Zone: " + cfg.Zone)
+	}
+}
+
 func TestGcloudCorruptedMissingConfig(t *testing.T) {
 	cfgDir := testGcloudConfigDir("corrupted")
-	_, err := buildGcloudEnvConfig(cfgDir)
+	_, err := buildGcloudEnvConfig(cfgDir, true)
 
 	if err == nil {
 		t.Fatal("Corrupted did not encounter an error.")
@@ -60,7 +94,7 @@ func TestGcloudCorruptedMissingConfig(t *testing.T) {
 
 func TestGcloudCorruptedNoConfigurationsDirectory(t *testing.T) {
 	cfgDir := testGcloudConfigDir("corrupted2")
-	cfg, err := buildGcloudEnvConfig(cfgDir)
+	cfg, err := buildGcloudEnvConfig(cfgDir, true)
 
 	if err != nil {
 		t.Fatal(err)
@@ -81,7 +115,7 @@ func TestGcloudCorruptedNoConfigurationsDirectory(t *testing.T) {
 
 func TestGcloudIncomplete(t *testing.T) {
 	cfgDir := testGcloudConfigDir("incomplete")
-	cfg, err := buildGcloudEnvConfig(cfgDir)
+	cfg, err := buildGcloudEnvConfig(cfgDir, true)
 
 	if err != nil {
 		t.Fatal(err)
@@ -106,7 +140,7 @@ func TestGcloudIncomplete(t *testing.T) {
 
 func TestGcloudNoConfig(t *testing.T) {
 	cfgDir := testGcloudConfigDir("no_config")
-	_, err := buildGcloudEnvConfig(cfgDir)
+	_, err := buildGcloudEnvConfig(cfgDir, true)
 
 	if err == nil {
 		t.Fatal(err)
@@ -116,9 +150,18 @@ func TestGcloudNoConfig(t *testing.T) {
 	}
 }
 
+func TestGcloudNoConfigSkipCheck(t *testing.T) {
+	cfgDir := testGcloudConfigDir("no_config")
+	_, err := buildGcloudEnvConfig(cfgDir, false)
+
+	if err != nil {
+		t.Errorf("No error expected; got: %v", err)
+	}
+}
+
 func TestGcloudNoDir(t *testing.T) {
 	cfgDir := testGcloudConfigDir("not_there")
-	_, err := buildGcloudEnvConfig(cfgDir)
+	_, err := buildGcloudEnvConfig(cfgDir, true)
 	if err == nil {
 		t.Fatal(err)
 	}

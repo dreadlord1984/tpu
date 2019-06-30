@@ -18,13 +18,11 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+from absl import app
 from absl import flags
 import absl.logging as _logging  # pylint: disable=unused-import
 import tensorflow as tf
 
-from tensorflow.contrib.tpu.python.tpu import tpu_config
-from tensorflow.contrib.tpu.python.tpu import tpu_estimator
-from tensorflow.contrib.tpu.python.tpu import tpu_optimizer
 
 # Cloud TPU Cluster Resolvers
 flags.DEFINE_string(
@@ -90,11 +88,11 @@ def model_fn(features, labels, mode, params):
   )
   optimizer = tf.train.AdamOptimizer()
   if FLAGS.use_tpu:
-    optimizer = tpu_optimizer.CrossShardOptimizer(optimizer)
+    optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer)
 
   train_op = optimizer.minimize(loss, global_step=tf.train.get_global_step())
 
-  return tpu_estimator.TPUEstimatorSpec(
+  return tf.contrib.tpu.TPUEstimatorSpec(
       mode=mode,
       loss=loss,
       train_op=train_op,
@@ -127,9 +125,7 @@ def input_fn(params):
   dataset = tf.data.TFRecordDataset([FLAGS.train_file])
   dataset = dataset.map(parser, num_parallel_calls=batch_size)
   dataset = dataset.prefetch(4 * batch_size).cache().repeat()
-  dataset = dataset.apply(
-      tf.contrib.data.batch_and_drop_remainder(FLAGS.batch_size)
-  )
+  dataset = dataset.batch(FLAGS.batch_size, drop_remainder=True)
   dataset = dataset.prefetch(1)
   return dataset
 
@@ -142,18 +138,18 @@ def main(argv):
       zone=FLAGS.tpu_zone,
       project=FLAGS.gcp_project)
 
-  run_config = tpu_config.RunConfig(
+  run_config = tf.contrib.tpu.RunConfig(
       cluster=tpu_cluster_resolver,
       model_dir=FLAGS.model_dir,
       save_checkpoints_secs=3600,
       session_config=tf.ConfigProto(
           allow_soft_placement=True, log_device_placement=True),
-      tpu_config=tpu_config.TPUConfig(
+      tpu_config=tf.contrib.tpu.TPUConfig(
           iterations_per_loop=FLAGS.iterations_per_loop,
           num_shards=FLAGS.num_shards),
   )
 
-  estimator = tpu_estimator.TPUEstimator(
+  estimator = tf.contrib.tpu.TPUEstimator(
       model_fn=model_fn,
       use_tpu=FLAGS.use_tpu,
       config=run_config,
@@ -163,4 +159,4 @@ def main(argv):
 
 if __name__ == "__main__":
   tf.logging.set_verbosity(tf.logging.INFO)
-  tf.app.run(main)
+  app.run(main)

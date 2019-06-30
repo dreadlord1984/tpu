@@ -19,10 +19,12 @@ package config
 import (
 	"errors"
 	"fmt"
+	"os"
 	"os/user"
 	"regexp"
 	"strings"
 
+	"cloud.google.com/go/compute/metadata"
 	"flag"
 )
 
@@ -85,6 +87,8 @@ func (c *Config) Validate() error {
 func FromEnv() (cfg *Config, err error) {
 	if isDevshell() {
 		cfg, err = devshellConfig()
+	} else if metadata.OnGCE() {
+		cfg, err = gceConfig()
 	} else {
 		cfg, err = gcloudConfig()
 	}
@@ -103,12 +107,29 @@ func cleanFlockName(flockName string) string {
 }
 
 func (c *Config) computeFlockName() {
+	if c.FlockName != "" {
+		return
+	}
 	if len(c.account) < 2 {
+		username := ""
 		curUser, err := user.Current()
-		if err != nil {
-			return
+		if err == nil {
+			username = curUser.Username
+		} else {
+			var ok bool
+			username, ok = os.LookupEnv("USER")
+			if !ok {
+				// Sometimes the root user doesn't have $USER set; make one last attempt.
+				id := os.Getuid()
+				if id == 0 {
+					username = "root"
+				} else {
+					// Error case.
+					return
+				}
+			}
 		}
-		c.FlockName = cleanFlockName(curUser.Username)
+		c.FlockName = cleanFlockName(username)
 	} else {
 		submatches := usernameRegex.FindStringSubmatch(c.account)
 		if len(submatches) != 2 {

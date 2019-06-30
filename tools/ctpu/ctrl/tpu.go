@@ -16,6 +16,7 @@
 package ctrl
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -24,7 +25,6 @@ import (
 	"strings"
 	"time"
 
-	"context"
 	"github.com/tensorflow/tpu/tools/ctpu/config"
 	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
@@ -113,7 +113,18 @@ func (i *TPUInstance) IsRunning() bool {
 
 // IsPreemptible returns true if the Cloud TPU is a preemptible Cloud TPU, false otherwise.
 func (i *TPUInstance) IsPreemptible() bool {
-	return i.SchedulingConfig.Preemptible
+	if i.SchedulingConfig != nil {
+		return i.SchedulingConfig.Preemptible
+	}
+	return false
+}
+
+// IsReserved returns true if the Cloud TPU is a reserved Cloud TPU, false otherwise.
+func (i *TPUInstance) IsReserved() bool {
+	if i.SchedulingConfig != nil {
+		return i.SchedulingConfig.Reserved
+	}
+	return false
 }
 
 // NodeName returns the flock name (the human-usable name) of the Cloud TPU
@@ -208,6 +219,18 @@ func (g *TPUCP) ListLocations() ([]*tpu.Location, error) {
 	return locations.Locations, nil
 }
 
+// ListSizes retrieves all TPU sizes for the current configured location.
+func (g *TPUCP) ListSizes() ([]*tpu.AcceleratorType, error) {
+	types, err := g.locations.AcceleratorTypes.List(fmt.Sprintf("projects/%s/locations/%s", g.config.Project, g.config.Zone)).Do()
+	if err != nil {
+		return nil, err
+	}
+	if types.NextPageToken != "" {
+		log.Printf("Warning: not all available TPU sizes retrieved.")
+	}
+	return types.AcceleratorTypes, nil
+}
+
 const tpuMaxLoops = 180 // 15 minutes in 5 second increments
 
 func (g *TPUCP) parentPath() string {
@@ -216,9 +239,13 @@ func (g *TPUCP) parentPath() string {
 
 var legacyNetwork = net.IPv4(10, 240, 0, 0)
 
-func (g *TPUCP) selectCidrBlock(routes []*compute.Route) (string, error) {
+func (g *TPUCP) selectCIDRBlock(routes []*compute.Route, cidrBlockSize uint, network string) (string, error) {
 	cidrBlocks := make([]*net.IPNet, 0, len(routes))
 	for _, i := range routes {
+		// Filter out network ranges that are not peered with our GCP VPC Network.
+		if !strings.HasSuffix(i.Network, network) {
+			continue
+		}
 		_, ipNet, err := net.ParseCIDR(i.DestRange)
 		if err != nil {
 			return "", err
@@ -236,28 +263,63 @@ func (g *TPUCP) selectCidrBlock(routes []*compute.Route) (string, error) {
 		cidrBlocks = append(cidrBlocks, ipNet)
 	}
 
+	fourthOctetIncrement := 1 << (32 - cidrBlockSize)
+
 	// Select a random IP address.
 	for thirdOctet := byte(1); thirdOctet < 255; thirdOctet++ {
 	nextCandidate:
-		for fourthOctet := byte(1); fourthOctet < 255; fourthOctet += 8 {
-			candidateIPAddress := net.IPv4(10, 240, thirdOctet, fourthOctet)
-			for _, block := range cidrBlocks {
-				if block.Contains(candidateIPAddress) {
-					continue nextCandidate
+		for fourthOctetBase := 1; fourthOctetBase < 255; fourthOctetBase += fourthOctetIncrement {
+			for candidateFourthOctet := fourthOctetBase; candidateFourthOctet < fourthOctetBase+fourthOctetIncrement; candidateFourthOctet += 2 {
+				candidateIPAddress := net.IPv4(10, 240, thirdOctet, byte(candidateFourthOctet))
+				for _, block := range cidrBlocks {
+					if block.Contains(candidateIPAddress) {
+						continue nextCandidate
+					}
 				}
 			}
-			_, newCidr, err := net.ParseCIDR(fmt.Sprintf("%s/29", candidateIPAddress.String()))
+			candidateIPAddress := net.IPv4(10, 240, thirdOctet, byte(fourthOctetBase))
+			_, newCidr, err := net.ParseCIDR(fmt.Sprintf("%s/%d", candidateIPAddress.String(), cidrBlockSize))
 			if err != nil {
 				return "", fmt.Errorf("error parsing constructed CIDR: %v", err)
 			}
-			return newCidr.String(), nil
+			split := strings.Split(newCidr.String(), "/")
+			if len(split) != 2 {
+				return "", fmt.Errorf("error parsing cidr block %q", newCidr.String())
+			}
+			return split[0], nil
 		}
 	}
 	return "", errors.New("no available CIDR blocks found")
 }
 
+// TODO: handle cidr block sizes larger than 24 bits.
+var tpuDeviceNetworkSizes = map[string]uint{
+	"v2-8":    29,
+	"v2-32":   29,
+	"v2-128":  27,
+	"v2-256":  26,
+	"v2-512":  25,
+	"v3-8":    29,
+	"v3-32":   29,
+	"v3-64":   28,
+	"v3-128":  27,
+	"v3-256":  26,
+	"v3-512":  25,
+	"v3-1024": 24,
+	// "v3-2048": 24,  // TODO(saeta): Support full-size pods.
+}
+
+// cidrBlockSize returns the number of ones in the CIDR range, or an error.
+func (g *TPUCP) cidrBlockSize(hardwareType string) (ones uint, err error) {
+	cidrBits, present := tpuDeviceNetworkSizes[hardwareType]
+	if !present {
+		return 0, fmt.Errorf("unknown TPU device size %q", hardwareType)
+	}
+	return cidrBits, nil
+}
+
 // CreateInstance creates the Cloud TPU with an API call to the TPU control plane.
-func (g *TPUCP) CreateInstance(ctx context.Context, version string, preemptible bool, hardwareType string) (LongRunningOperation, error) {
+func (g *TPUCP) CreateInstance(ctx context.Context, version string, preemptible, reserved bool, hardwareType, network string) (LongRunningOperation, error) {
 	routeItems := make([]*compute.Route, 0)
 	err := g.compute.Routes.List(g.config.Project).Pages(ctx, func(routeList *compute.RouteList) error {
 		routeItems = append(routeItems, routeList.Items...)
@@ -267,7 +329,11 @@ func (g *TPUCP) CreateInstance(ctx context.Context, version string, preemptible 
 		return nil, err
 	}
 
-	cidrBlock, err := g.selectCidrBlock(routeItems)
+	cidrBlockSize, err := g.cidrBlockSize(hardwareType)
+	if err != nil {
+		return nil, err
+	}
+	cidrBlock, err := g.selectCIDRBlock(routeItems, cidrBlockSize, network)
 	if err != nil {
 		return nil, err
 	}
@@ -277,7 +343,8 @@ func (g *TPUCP) CreateInstance(ctx context.Context, version string, preemptible 
 		CidrBlock:         cidrBlock,
 		Description:       "A Cloud TPU created with the ctpu tool.",
 		TensorflowVersion: version,
-		SchedulingConfig:  &tpu.SchedulingConfig{Preemptible: preemptible},
+		SchedulingConfig:  &tpu.SchedulingConfig{Preemptible: preemptible, Reserved: reserved},
+		Network:           network,
 	}
 	req := g.nodes.Create(g.parentPath(), &node)
 	op, err := req.NodeId(g.config.FlockName).Do()

@@ -36,8 +36,14 @@ from object_detection import target_assigner
 # The minimum score to consider a logit for identifying detections.
 MIN_CLASS_SCORE = -5.0
 
+# The score for a dummy detection
+_DUMMY_DETECTION_SCORE = -1e5
+
 # The maximum number of (anchor,class) pairs to keep for non-max suppression.
 MAX_DETECTION_POINTS = 5000
+
+# The maximum number of detections per image.
+MAX_DETECTIONS_PER_IMAGE = 100
 
 
 def sigmoid(x):
@@ -180,41 +186,35 @@ def _generate_anchor_boxes(image_size, anchor_scale, anchor_configs):
   return anchor_boxes
 
 
-def _generate_detections(cls_outputs, box_outputs, anchor_boxes, image_id):
+def _generate_detections(cls_outputs, box_outputs, anchor_boxes, indices,
+                         classes, image_id, image_scale, num_classes):
   """Generates detections with RetinaNet model outputs and anchors.
 
   Args:
-    cls_outputs: a numpy array with shape [N, num_classes], which stacks class
-      logit outputs on all feature levels. The N is the number of total anchors
-      on all levels. The num_classes is the number of classes predicted by the
-      model.
+    cls_outputs: a numpy array with shape [N, 1], which has the highest class
+      scores on all feature levels. The N is the number of selected
+      top-K total anchors on all levels.  (k being MAX_DETECTION_POINTS)
     box_outputs: a numpy array with shape [N, 4], which stacks box regression
-      outputs on all feature levels. The N is the number of total anchors on all
-      levels.
+      outputs on all feature levels. The N is the number of selected top-k
+      total anchors on all levels. (k being MAX_DETECTION_POINTS)
     anchor_boxes: a numpy array with shape [N, 4], which stacks anchors on all
-      feature levels. The N is the number of total anchors on all levels.
+      feature levels. The N is the number of selected top-k total anchors on
+      all levels.
+    indices: a numpy array with shape [N], which is the indices from top-k
+      selection.
+    classes: a numpy array with shape [N], which represents the class
+      prediction on all selected anchors from top-k selection.
     image_id: an integer number to specify the image id.
+    image_scale: a float tensor representing the scale between original image
+      and input image for the detector. It is used to rescale detections for
+      evaluating with the original groundtruth annotations.
+    num_classes: a integer that indicates the number of classes.
   Returns:
     detections: detection results in a tensor with each row representing
       [image_id, x, y, width, height, score, class]
   """
-  num_classes = cls_outputs.shape[1]
-  cls_outputs_reshape = cls_outputs.reshape(-1)
-  # speed up inference by filtering out low scoring logits
-  indices = np.where(cls_outputs_reshape > MIN_CLASS_SCORE)[0]
-  if indices.any():
-    length = min(len(indices), MAX_DETECTION_POINTS)
-    # use argpartition instead of argsort to speed up
-    indices_top_k = np.argpartition(
-        -cls_outputs_reshape[indices], length-1)[0:length-1]
-    indices_top_k = indices[indices_top_k]
-  else:
-    indices_top_k = np.argsort(-cls_outputs_reshape)[0:MAX_DETECTION_POINTS]
-
-  indices, classes = np.unravel_index(indices_top_k, cls_outputs.shape)
   anchor_boxes = anchor_boxes[indices, :]
-  box_outputs = box_outputs[indices, :]
-  scores = sigmoid(cls_outputs[indices, classes])
+  scores = sigmoid(cls_outputs)
   # apply bounding box regression to anchors
   boxes = decode_box_outputs(
       box_outputs.swapaxes(0, 1), anchor_boxes.swapaxes(0, 1))
@@ -242,10 +242,27 @@ def _generate_detections(cls_outputs, box_outputs, anchor_boxes, image_id):
     )
     detections.append(top_detections_cls)
 
-  detections = np.vstack(detections)
-  # take final 100 detections
-  indices = np.argsort(-detections[:, -2])
-  detections = np.array(detections[indices[0:100]], dtype=np.float32)
+  def _generate_dummy_detections(number):
+    detections_dummy = np.zeros((number, 7), dtype=np.float32)
+    detections_dummy[:, 0] = image_id[0]
+    detections_dummy[:, 5] = _DUMMY_DETECTION_SCORE
+    return detections_dummy
+
+  if detections:
+    detections = np.vstack(detections)
+    # take final 100 detections
+    indices = np.argsort(-detections[:, -2])
+    detections = np.array(
+        detections[indices[0:MAX_DETECTIONS_PER_IMAGE]], dtype=np.float32)
+    # Add dummy detections to fill up to 100 detections
+    n = max(MAX_DETECTIONS_PER_IMAGE - len(detections), 0)
+    detections_dummy = _generate_dummy_detections(n)
+    detections = np.vstack([detections, detections_dummy])
+    detections[:, 1:5] *= image_scale
+  else:
+    detections = _generate_dummy_detections(MAX_DETECTIONS_PER_IMAGE)
+    detections[:, 1:5] *= image_scale
+
   return detections
 
 
@@ -375,16 +392,9 @@ class AnchorLabeler(object):
 
     return cls_targets_dict, box_targets_dict, num_positives
 
-  def generate_detections(self, cls_ouputs, box_outputs, image_id):
-    cls_outputs_all = []
-    box_outputs_all = []
-    for level in range(self._anchors.min_level, self._anchors.max_level + 1):
-      cls_outputs_all.append(
-          tf.reshape(cls_ouputs[level], [-1, self._num_classes]))
-      box_outputs_all.append(tf.reshape(box_outputs[level], [-1, 4]))
-    cls_outputs_all = tf.concat(cls_outputs_all, 0)
-    box_outputs_all = tf.concat(box_outputs_all, 0)
-    return tf.py_func(
-        _generate_detections,
-        [cls_outputs_all, box_outputs_all, self._anchors.boxes, image_id],
-        tf.float32)
+  def generate_detections(self, cls_outputs, box_outputs, indices, classes,
+                          image_id, image_scale):
+    return tf.py_func(_generate_detections, [
+        cls_outputs, box_outputs, self._anchors.boxes, indices, classes,
+        image_id, image_scale, self._num_classes
+    ], tf.float32)

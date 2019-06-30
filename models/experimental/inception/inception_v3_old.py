@@ -21,6 +21,7 @@ from __future__ import print_function
 
 import os
 
+from absl import app
 from absl import flags
 import tensorflow as tf
 
@@ -28,9 +29,6 @@ from tensorflow.contrib import slim
 
 from tensorflow.contrib.slim.nets import inception
 
-from tensorflow.contrib.tpu.python.tpu import tpu_config
-from tensorflow.contrib.tpu.python.tpu import tpu_estimator
-from tensorflow.contrib.tpu.python.tpu import tpu_optimizer
 
 
 flags.DEFINE_float('learning_rate', 0.02, 'Learning rate.')
@@ -147,12 +145,12 @@ def model_fn(features, labels, mode, params):
     tf.logging.fatal('Unknown optimizer:', FLAGS.optimizer)
 
   if FLAGS.use_tpu:
-    optimizer = tpu_optimizer.CrossShardOptimizer(optimizer)
+    optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer)
 
   train_op = optimizer.minimize(
       loss, global_step=tf.train.get_or_create_global_step())
 
-  return tpu_estimator.TPUEstimatorSpec(mode=mode, loss=loss, train_op=train_op)
+  return tf.contrib.tpu.TPUEstimatorSpec(mode=mode, loss=loss, train_op=train_op)
 
 
 def input_fn(params):
@@ -253,7 +251,7 @@ def input_fn(params):
     data_dir = FLAGS.data_dir
     filenames = [
         os.path.join(data_dir, 'train-%05d-of-01024' % i)
-        for i in xrange(0, 984)
+        for i in range(0, 984)
     ]
     dataset = tf.data.TFRecordDataset(filenames)
     dataset = dataset.repeat().map(parser).batch(batch_size)
@@ -276,15 +274,15 @@ def main(unused_argv):
 
   tf.logging.set_verbosity(tf.logging.INFO)
 
-  run_config = tpu_config.RunConfig(
+  run_config = tf.contrib.tpu.RunConfig(
       master=FLAGS.master,
       model_dir=FLAGS.model_dir,
       save_checkpoints_secs=FLAGS.save_checkpoints_secs,
       session_config=tf.ConfigProto(),
-      tpu_config=tpu_config.TPUConfig(FLAGS.iterations, FLAGS.num_shards),
+      tpu_config=tf.contrib.tpu.TPUConfig(FLAGS.iterations, FLAGS.num_shards),
   )
 
-  estimator = tpu_estimator.TPUEstimator(
+  estimator = tf.contrib.tpu.TPUEstimator(
       model_fn=model_fn,
       use_tpu=FLAGS.use_tpu,
       config=run_config,
@@ -294,4 +292,4 @@ def main(unused_argv):
 
 
 if __name__ == '__main__':
-  tf.app.run()
+  app.run(main)

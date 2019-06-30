@@ -21,6 +21,7 @@ from __future__ import print_function
 
 import os
 import time
+from absl import app
 from absl import flags
 import absl.logging as _logging  # pylint: disable=unused-import
 import tensorflow as tf
@@ -31,10 +32,6 @@ import vgg_preprocessing
 from tensorflow.contrib import summary
 from tensorflow.contrib.framework.python.ops import arg_scope
 from tensorflow.contrib.slim.nets import inception
-from tensorflow.contrib.tpu.python.tpu import bfloat16
-from tensorflow.contrib.tpu.python.tpu import tpu_config
-from tensorflow.contrib.tpu.python.tpu import tpu_estimator
-from tensorflow.contrib.tpu.python.tpu import tpu_optimizer
 from tensorflow.contrib.training.python.training import evaluation
 
 
@@ -52,7 +49,7 @@ flags.DEFINE_string(
     help='GCE zone where the Cloud TPU is located in. If not specified, we '
     'will attempt to automatically detect the GCE project from metadata.')
 
-# Model specific paramenters
+# Model specific parameters
 flags.DEFINE_string(
     'data_dir', '',
     'Directory where input data is stored')
@@ -60,6 +57,11 @@ flags.DEFINE_string(
 flags.DEFINE_string(
     'model_dir', None,
     'Directory where model output is stored')
+
+flags.DEFINE_string(
+    'export_dir',
+    default=None,
+    help=('The directory where the exported SavedModel will be stored.'))
 
 flags.DEFINE_integer(
     'num_shards', 8,
@@ -113,10 +115,6 @@ flags.DEFINE_integer(
 flags.DEFINE_bool(
     'use_tpu', True,
     'Use TPUs rather than plain CPUs')
-
-flags.DEFINE_boolean(
-    'per_host_input_for_training', True,
-    'If true, input_fn is invoked per host rather than per shard.')
 
 flags.DEFINE_string(
     'use_data', 'real',
@@ -258,6 +256,44 @@ BATCH_NORM_EPSILON = 1e-3
 WEIGHT_DECAY = 0.00004
 
 
+def preprocess_raw_bytes(image_bytes, is_training=False, bbox=None):
+  """Preprocesses a raw JPEG image.
+
+  This implementation is shared in common between train/eval pipelines,
+  and when serving the model.
+
+  Args:
+    image_bytes: A string Tensor, containing the encoded JPEG.
+    is_training: Whether or not to preprocess for training.
+    bbox:        In inception preprocessing, this bbox can be used for cropping.
+
+  Returns:
+    A 3-Tensor [height, width, RGB channels] of type float32.
+  """
+
+  image = tf.image.decode_jpeg(image_bytes, channels=3)
+  image = tf.image.convert_image_dtype(image, dtype=tf.float32)
+
+  if FLAGS.preprocessing == 'vgg':
+    image = vgg_preprocessing.preprocess_image(
+        image=image,
+        output_height=FLAGS.height,
+        output_width=FLAGS.width,
+        is_training=is_training,
+        resize_side_min=_RESIZE_SIDE_MIN,
+        resize_side_max=_RESIZE_SIDE_MAX)
+  elif FLAGS.preprocessing == 'inception':
+    image = inception_preprocessing.preprocess_image(
+        image=image,
+        output_height=FLAGS.height,
+        output_width=FLAGS.width,
+        is_training=is_training,
+        bbox=bbox)
+  else:
+    assert False, 'Unknown preprocessing type: %s' % FLAGS.preprocessing
+  return image
+
+
 class InputPipeline(object):
   """Generates ImageNet input_fn for training or evaluation.
 
@@ -323,25 +359,7 @@ class InputPipeline(object):
       bbox = tf.transpose(bbox, [0, 2, 1])
 
     image = features['image/encoded']
-    image = tf.image.decode_jpeg(image, channels=3)
-    image = tf.image.convert_image_dtype(image, dtype=tf.float32)
-
-    if FLAGS.preprocessing == 'vgg':
-      image = vgg_preprocessing.preprocess_image(
-          image=image,
-          output_height=FLAGS.height,
-          output_width=FLAGS.width,
-          is_training=self.is_training,
-          resize_side_min=_RESIZE_SIDE_MIN,
-          resize_side_max=_RESIZE_SIDE_MAX)
-    elif FLAGS.preprocessing == 'inception':
-      image = inception_preprocessing.preprocess_image(
-          image=image,
-          output_height=FLAGS.height,
-          output_width=FLAGS.width,
-          is_training=self.is_training,
-          bbox=bbox)
-
+    image = preprocess_raw_bytes(image, is_training=self.is_training, bbox=bbox)
     label = tf.cast(
         tf.reshape(features['image/class/label'], shape=[]), dtype=tf.int32)
 
@@ -350,71 +368,91 @@ class InputPipeline(object):
 
     return image, label
 
-  def dataset_iterator(self, batch_size, shuffle):
-    """Constructs a real-data iterator over batches for train or eval.
-
-    Args:
-      batch_size: The effective batch size.
-      shuffle: Whether or not to shuffle the data.
-
-    Returns:
-      A tf.data iterator.
-    """
-    file_pattern = os.path.join(self.data_dir, 'train-*'
-                                if self.is_training else 'validation-*')
-    dataset = tf.data.Dataset.list_files(file_pattern, shuffle=self.is_training)
-
-    if self.is_training:
-      dataset = dataset.repeat()
-
-    def prefetch_dataset(filename):
-      dataset = tf.data.TFRecordDataset(
-          filename, buffer_size=FLAGS.prefetch_dataset_buffer_size)
-      return dataset
-
-    dataset = dataset.apply(
-        tf.contrib.data.parallel_interleave(
-            prefetch_dataset, cycle_length=FLAGS.num_files_infeed, sloppy=True))
-
-    if shuffle and FLAGS.followup_shuffle_buffer_size > 0:
-      dataset = dataset.shuffle(buffer_size=FLAGS.followup_shuffle_buffer_size)
-
-    dataset = dataset.map(
-        self.dataset_parser, num_parallel_calls=FLAGS.num_parallel_calls)
-
-    dataset = dataset.prefetch(batch_size)
-
-    dataset = dataset.apply(
-        tf.contrib.data.batch_and_drop_remainder(batch_size))
-
-    dataset = dataset.prefetch(2)  # Prefetch overlaps in-feed with training
-
-    return dataset.make_one_shot_iterator()
-
   def input_fn(self, params):
     """Input function which provides a single batch for train or eval.
 
     Args:
       params: `dict` of parameters passed from the `TPUEstimator`.
-          `params['batch_size']` is always provided and should be used as the
-          effective batch size.
+        `params['batch_size']` is always provided and should be used as the
+        effective batch size.
 
     Returns:
-      A (images, labels) tuple of `Tensor`s for a batch of samples.
+      A `tf.data.Dataset` object.
     """
     batch_size = params['batch_size']
 
     if FLAGS.use_data == 'real':
-      images, labels = self.dataset_iterator(batch_size,
-                                             self.is_training).get_next()
-    else:
-      images = tf.random_uniform(
-          [batch_size, FLAGS.height, FLAGS.width, 3], minval=-1, maxval=1)
-      labels = tf.random_uniform(
-          [batch_size], minval=0, maxval=999, dtype=tf.int32)
+      assert self.data_dir, 'data_dir is required'
+      shuffle = self.is_training
+      file_pattern = os.path.join(
+          self.data_dir, 'train-*' if self.is_training else 'validation-*')
+      dataset = tf.data.Dataset.list_files(file_pattern, shuffle=shuffle)
 
-    images = tensor_transform_fn(images, params['output_perm'])
-    return images, labels
+      if self.is_training:
+        dataset = dataset.repeat()
+
+      def prefetch_dataset(filename):
+        dataset = tf.data.TFRecordDataset(
+            filename, buffer_size=FLAGS.prefetch_dataset_buffer_size)
+        return dataset
+
+      dataset = dataset.apply(
+          tf.contrib.data.parallel_interleave(
+              prefetch_dataset,
+              cycle_length=FLAGS.num_files_infeed,
+              sloppy=True))
+
+      if shuffle and FLAGS.followup_shuffle_buffer_size > 0:
+        dataset = dataset.shuffle(
+            buffer_size=FLAGS.followup_shuffle_buffer_size)
+
+      dataset = dataset.map(
+          self.dataset_parser, num_parallel_calls=FLAGS.num_parallel_calls)
+    else:
+      random_image = tf.random.uniform(
+          [FLAGS.height, FLAGS.width, 3],
+          minval=-1,
+          maxval=1,
+          dtype=tf.bfloat16 if self.use_bfloat16 else tf.float32)
+      random_label = tf.random.uniform([], minval=0, maxval=999, dtype=tf.int32)
+      dataset = tf.data.Dataset.range(1).repeat().map(
+          lambda data: (random_image, random_label))
+
+    dataset = dataset.prefetch(batch_size)
+
+    dataset = dataset.batch(batch_size, drop_remainder=True)
+
+    dataset = dataset.prefetch(2)  # Prefetch overlaps in-feed with training
+
+    if FLAGS.transpose_enabled:
+
+      def transpose_images(images):
+        return tf.transpose(images, params['output_perm'])
+
+      dataset = dataset.map(
+          lambda images, labels: (transpose_images(images), labels),
+          num_parallel_calls=FLAGS.num_parallel_calls)
+
+    return dataset
+
+
+def image_serving_input_fn():
+  """Serving input fn for raw images.
+
+  This function is consumed when exporting a SavedModel.
+
+  Returns:
+    A ServingInputReceiver capable of serving MobileNet predictions.
+  """
+
+  image_bytes_list = tf.placeholder(
+      shape=[None],
+      dtype=tf.string,
+  )
+  images = tf.map_fn(
+      preprocess_raw_bytes, image_bytes_list, back_prop=False, dtype=tf.float32)
+  return tf.estimator.export.ServingInputReceiver(
+      images, {'image_bytes': image_bytes_list})
 
 
 def tensor_transform_fn(data, perm):
@@ -445,13 +483,17 @@ def inception_model_fn(features, labels, mode, params):
   num_classes = FLAGS.num_classes
   is_training = (mode == tf.estimator.ModeKeys.TRAIN)
   is_eval = (mode == tf.estimator.ModeKeys.EVAL)
+
+  if isinstance(features, dict):
+    features = features['feature']
+
   features = tensor_transform_fn(features, params['input_perm'])
 
   # This nested function allows us to avoid duplicating the logic which
   # builds the network, for different values of --precision.
   def build_network():
     if FLAGS.precision == 'bfloat16':
-      with bfloat16.bfloat16_scope():
+      with tf.contrib.tpu.bfloat16_scope():
         logits, end_points = inception.inception_v3(
             features,
             num_classes,
@@ -478,14 +520,18 @@ def inception_model_fn(features, labels, mode, params):
         batch_norm_epsilon=BATCH_NORM_EPSILON)):
       logits, end_points = build_network()
 
-  predictions = end_points
-  predictions.update({
+  predictions = {
       'classes': tf.argmax(input=logits, axis=1),
       'probabilities': tf.nn.softmax(logits, name='softmax_tensor')
-  })
+  }
 
   if mode == tf.estimator.ModeKeys.PREDICT:
-    return tf.estimator.EstimatorSpec(mode=mode, predictions=predictions)
+    return tf.estimator.EstimatorSpec(
+        mode=mode,
+        predictions=predictions,
+        export_outputs={
+            'classify': tf.estimator.export.PredictOutput(predictions)
+        })
 
   if mode == tf.estimator.ModeKeys.EVAL and FLAGS.display_tensors and (
       not FLAGS.use_tpu):
@@ -588,7 +634,7 @@ def inception_model_fn(features, labels, mode, params):
       tf.logging.fatal('Unknown optimizer:', FLAGS.optimizer)
 
     if FLAGS.use_tpu:
-      optimizer = tpu_optimizer.CrossShardOptimizer(optimizer)
+      optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer)
 
     update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
     with tf.control_dependencies(update_ops):
@@ -677,7 +723,7 @@ def inception_model_fn(features, labels, mode, params):
 
     eval_metrics = (metric_fn, [labels, logits])
 
-  return tpu_estimator.TPUEstimatorSpec(
+  return tf.contrib.tpu.TPUEstimatorSpec(
       mode=mode,
       loss=loss,
       train_op=train_op,
@@ -738,10 +784,10 @@ def main(unused_argv):
   eval_batch_size = (None if FLAGS.mode == 'train' else
                      FLAGS.eval_batch_size)
 
-  per_host_input_for_training = (
-      FLAGS.num_shards <= 8 if FLAGS.mode == 'train' else True)
+  tpu_config = tf.contrib.tpu.TPUConfig(
+      iterations_per_loop=iterations, num_shards=FLAGS.num_shards)
 
-  run_config = tpu_config.RunConfig(
+  run_config = tf.contrib.tpu.RunConfig(
       cluster=tpu_cluster_resolver,
       model_dir=FLAGS.model_dir,
       save_checkpoints_secs=FLAGS.save_checkpoints_secs,
@@ -749,12 +795,9 @@ def main(unused_argv):
       session_config=tf.ConfigProto(
           allow_soft_placement=True,
           log_device_placement=FLAGS.log_device_placement),
-      tpu_config=tpu_config.TPUConfig(
-          iterations_per_loop=iterations,
-          num_shards=FLAGS.num_shards,
-          per_host_input_for_training=per_host_input_for_training))
+      tpu_config=tpu_config)
 
-  inception_classifier = tpu_estimator.TPUEstimator(
+  inception_classifier = tf.contrib.tpu.TPUEstimator(
       model_fn=inception_model_fn,
       use_tpu=FLAGS.use_tpu,
       config=run_config,
@@ -782,7 +825,8 @@ def main(unused_argv):
 
   if FLAGS.mode == 'eval':
     # Run evaluation when there is a new checkpoint
-    for checkpoint in evaluation.checkpoints_iterator(FLAGS.model_dir):
+    for checkpoint in evaluation.checkpoints_iterator(
+        FLAGS.model_dir, timeout=FLAGS.eval_timeout):
       tf.logging.info('Starting to evaluate.')
       try:
         start_timestamp = time.time()  # Includes compilation time
@@ -825,7 +869,13 @@ def main(unused_argv):
     inception_classifier.train(
         input_fn=imagenet_train.input_fn, max_steps=FLAGS.train_steps)
 
+  if FLAGS.export_dir is not None:
+    tf.logging.info('Starting to export model.')
+    inception_classifier.export_saved_model(
+        export_dir_base=FLAGS.export_dir,
+        serving_input_receiver_fn=image_serving_input_fn)
+
 
 if __name__ == '__main__':
   tf.logging.set_verbosity(tf.logging.INFO)
-  tf.app.run()
+  app.run(main)

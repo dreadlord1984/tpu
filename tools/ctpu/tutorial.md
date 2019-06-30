@@ -136,8 +136,11 @@ to download and preprocess the
 [images](http://yann.lecun.com/exdb/mnist/index.html):
 
 ```bash
-python /usr/share/tensorflow/tensorflow/examples/how_tos/reading_data/convert_to_records.py --directory=./data && \
-  gunzip ./data/*.gz
+python /usr/share/tensorflow/tensorflow/examples/how_tos/reading_data/convert_to_records.py --directory=./data
+```
+
+```bash
+gunzip ./data/*.gz
 ```
 
 Upload the preprocessed records to your Cloud Storage bucket (the environment
@@ -153,10 +156,7 @@ gsutil cp -r ./data gs://$GCS_BUCKET_NAME/mnist/data
 Now that you have your data prepared, you're ready to train. Execute:
 
 ```bash
-python /usr/share/models/official/mnist/mnist_tpu.py \
-  --data_dir=gs://$GCS_BUCKET_NAME/mnist/data/ \
-  --model_dir=gs://$GCS_BUCKET_NAME/mnist/model \
-  --tpu=$TPU_NAME
+python /usr/share/models/official/mnist/mnist_tpu.py --data_dir=gs://$GCS_BUCKET_NAME/mnist/data/ --model_dir=gs://$GCS_BUCKET_NAME/mnist/model --tpu=$TPU_NAME
 ```
 
 ### What's happening? ###
@@ -216,16 +216,10 @@ and open port `8080`.
 The [ResNet](https://github.com/tensorflow/tpu/tree/master/models/official/resnet)
 model is pre-loaded on your Compute Engine VM.
 
-If TensorBoard has taken over your Cloud Shell tab, open another tab and run
-`ctpu up` in the new shell to connect to your Compute Engine VM:
-
 To start training ResNet-50, execute:
 
 ```bash
-python /usr/share/tpu/models/official/resnet/resnet_main.py \
-  --data_dir=gs://cloud-tpu-test-datasets/fake_imagenet \
-  --model_dir=gs://$GCS_BUCKET_NAME/resnet \
-  --tpu=$TPU_NAME
+python /usr/share/tpu/models/official/resnet/resnet_main.py --data_dir=gs://cloud-tpu-test-datasets/fake_imagenet --model_dir=gs://$GCS_BUCKET_NAME/resnet --tpu=$TPU_NAME
 ```
 
 `resnet_main.py` will connect to your Cloud TPU, initialize the device, and

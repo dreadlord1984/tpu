@@ -21,6 +21,7 @@ from __future__ import print_function
 
 import os
 import time
+from absl import app
 from absl import flags
 import absl.logging as _logging  # pylint: disable=unused-import
 import tensorflow as tf
@@ -31,10 +32,6 @@ import vgg_preprocessing
 
 from tensorflow.contrib import summary
 from tensorflow.contrib.framework.python.ops import arg_scope
-from tensorflow.contrib.tpu.python.tpu import bfloat16
-from tensorflow.contrib.tpu.python.tpu import tpu_config
-from tensorflow.contrib.tpu.python.tpu import tpu_estimator
-from tensorflow.contrib.tpu.python.tpu import tpu_optimizer
 from tensorflow.contrib.training.python.training import evaluation
 
 # Cloud TPU Cluster Resolvers
@@ -59,6 +56,11 @@ flags.DEFINE_string(
 flags.DEFINE_string(
     'model_dir', None,
     'Directory where model output is stored')
+
+flags.DEFINE_string(
+    'export_dir',
+    default=None,
+    help=('The directory where the exported SavedModel will be stored.'))
 
 flags.DEFINE_integer(
     'num_shards', 8,
@@ -257,6 +259,44 @@ BATCH_NORM_EPSILON = 1e-3
 WEIGHT_DECAY = 0.00004
 
 
+def preprocess_raw_bytes(image_bytes, is_training=False, bbox=None):
+  """Preprocesses a raw JPEG image.
+
+  This implementation is shared in common between train/eval pipelines,
+  and when serving the model.
+
+  Args:
+    image_bytes: A string Tensor, containing the encoded JPEG.
+    is_training: Whether or not to preprocess for training.
+    bbox:        In inception preprocessing, this bbox can be used for cropping.
+
+  Returns:
+    A 3-Tensor [height, width, RGB channels] of type float32.
+  """
+
+  image = tf.image.decode_jpeg(image_bytes, channels=3)
+  image = tf.image.convert_image_dtype(image, dtype=tf.float32)
+
+  if FLAGS.preprocessing == 'vgg':
+    image = vgg_preprocessing.preprocess_image(
+        image=image,
+        output_height=FLAGS.height,
+        output_width=FLAGS.width,
+        is_training=is_training,
+        resize_side_min=_RESIZE_SIDE_MIN,
+        resize_side_max=_RESIZE_SIDE_MAX)
+  elif FLAGS.preprocessing == 'inception':
+    image = inception_preprocessing.preprocess_image(
+        image=image,
+        output_height=FLAGS.height,
+        output_width=FLAGS.width,
+        is_training=is_training,
+        bbox=bbox)
+  else:
+    assert False, 'Unknown preprocessing type: %s' % FLAGS.preprocessing
+  return image
+
+
 class InputPipeline(object):
   """Generates ImageNet input_fn for training or evaluation.
 
@@ -322,26 +362,7 @@ class InputPipeline(object):
       bbox = tf.transpose(bbox, [0, 2, 1])
 
     image = features['image/encoded']
-    image = tf.image.decode_jpeg(image, channels=3)
-    image = tf.image.convert_image_dtype(image, dtype=tf.float32)
-
-    if FLAGS.preprocessing == 'vgg':
-      image = vgg_preprocessing.preprocess_image(
-          image=image,
-          output_height=FLAGS.height,
-          output_width=FLAGS.width,
-          is_training=self.is_training,
-          resize_side_min=_RESIZE_SIDE_MIN,
-          resize_side_max=_RESIZE_SIDE_MAX)
-    elif FLAGS.preprocessing == 'inception':
-      image = inception_preprocessing.preprocess_image(
-          image=image,
-          output_height=FLAGS.height,
-          output_width=FLAGS.width,
-          is_training=self.is_training,
-          bbox=bbox,
-          fast_mode=False)
-
+    image = preprocess_raw_bytes(image, is_training=self.is_training, bbox=bbox)
     label = tf.cast(
         tf.reshape(features['image/class/label'], shape=[]), dtype=tf.int32)
 
@@ -393,8 +414,7 @@ class InputPipeline(object):
 
       dataset = dataset.prefetch(batch_size)
 
-      dataset = dataset.apply(
-          tf.contrib.data.batch_and_drop_remainder(batch_size))
+      dataset = dataset.batch(batch_size, drop_remainder=True)
 
       dataset = dataset.prefetch(2)  # Prefetch overlaps in-feed with training
 
@@ -407,6 +427,25 @@ class InputPipeline(object):
 
     images = tensor_transform_fn(images, params['pipeline_transpose_dims'])
     return images, labels
+
+
+def image_serving_input_fn():
+  """Serving input fn for raw images.
+
+  This function is consumed when exporting a SavedModel.
+
+  Returns:
+    A ServingInputReceiver capable of serving MobileNet predictions.
+  """
+
+  image_bytes_list = tf.placeholder(
+      shape=[None],
+      dtype=tf.string,
+  )
+  images = tf.map_fn(
+      preprocess_raw_bytes, image_bytes_list, back_prop=False, dtype=tf.float32)
+  return tf.estimator.export.ServingInputReceiver(
+      images, {'image_bytes': image_bytes_list})
 
 
 def tensor_transform_fn(data, perm):
@@ -437,13 +476,17 @@ def inception_model_fn(features, labels, mode, params):
   num_classes = FLAGS.num_classes
   is_training = (mode == tf.estimator.ModeKeys.TRAIN)
   is_eval = (mode == tf.estimator.ModeKeys.EVAL)
+
+  if isinstance(features, dict):
+    features = features['feature']
+
   features = tensor_transform_fn(features, params['model_transpose_dims'])
 
   # This nested function allows us to avoid duplicating the logic which
   # builds the network, for different values of --precision.
   def build_network():
     if FLAGS.precision == 'bfloat16':
-      with bfloat16.bfloat16_scope():
+      with tf.contrib.tpu.bfloat16_scope():
         logits, end_points = inception.inception_v4(
             features,
             num_classes,
@@ -469,14 +512,18 @@ def inception_model_fn(features, labels, mode, params):
         batch_norm_epsilon=BATCH_NORM_EPSILON)):
       logits, end_points = build_network()
 
-  predictions = end_points
-  predictions.update({
+  predictions = {
       'classes': tf.argmax(input=logits, axis=1),
       'probabilities': tf.nn.softmax(logits, name='softmax_tensor')
-  })
+  }
 
   if mode == tf.estimator.ModeKeys.PREDICT:
-    return tf.estimator.EstimatorSpec(mode=mode, predictions=predictions)
+    return tf.estimator.EstimatorSpec(
+        mode=mode,
+        predictions=predictions,
+        export_outputs={
+            'classify': tf.estimator.export.PredictOutput(predictions)
+        })
 
   if mode == tf.estimator.ModeKeys.EVAL and FLAGS.display_tensors and (
       not FLAGS.use_tpu):
@@ -567,7 +614,7 @@ def inception_model_fn(features, labels, mode, params):
       tf.logging.fatal('Unknown optimizer:', FLAGS.optimizer)
 
     if FLAGS.use_tpu:
-      optimizer = tpu_optimizer.CrossShardOptimizer(optimizer)
+      optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer)
 
     update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
     with tf.control_dependencies(update_ops):
@@ -656,7 +703,7 @@ def inception_model_fn(features, labels, mode, params):
 
     eval_metrics = (metric_fn, [labels, logits])
 
-  return tpu_estimator.TPUEstimatorSpec(
+  return tf.contrib.tpu.TPUEstimatorSpec(
       mode=mode,
       loss=loss,
       train_op=train_op,
@@ -732,7 +779,7 @@ def main(unused_argv):
   per_host_input_for_training = (
       FLAGS.num_shards <= 8 if FLAGS.mode == 'train' else True)
 
-  run_config = tpu_config.RunConfig(
+  run_config = tf.contrib.tpu.RunConfig(
       cluster=tpu_cluster_resolver,
       model_dir=FLAGS.model_dir,
       save_checkpoints_secs=FLAGS.save_checkpoints_secs,
@@ -740,12 +787,12 @@ def main(unused_argv):
       session_config=tf.ConfigProto(
           allow_soft_placement=True,
           log_device_placement=FLAGS.log_device_placement),
-      tpu_config=tpu_config.TPUConfig(
+      tpu_config=tf.contrib.tpu.TPUConfig(
           iterations_per_loop=iterations,
           num_shards=FLAGS.num_shards,
           per_host_input_for_training=per_host_input_for_training))
 
-  inception_classifier = tpu_estimator.TPUEstimator(
+  inception_classifier = tf.contrib.tpu.TPUEstimator(
       model_fn=inception_model_fn,
       use_tpu=FLAGS.use_tpu,
       config=run_config,
@@ -773,7 +820,8 @@ def main(unused_argv):
 
   if FLAGS.mode == 'eval':
     # Run evaluation when there is a new checkpoint
-    for checkpoint in evaluation.checkpoints_iterator(FLAGS.model_dir):
+    for checkpoint in evaluation.checkpoints_iterator(
+        FLAGS.model_dir, timeout=FLAGS.eval_timeout):
       tf.logging.info('Starting to evaluate.')
       try:
         start_timestamp = time.time()  # Includes compilation time
@@ -816,7 +864,13 @@ def main(unused_argv):
     inception_classifier.train(
         input_fn=imagenet_train.input_fn, max_steps=FLAGS.train_steps)
 
+  if FLAGS.export_dir is not None:
+    tf.logging.info('Starting to export model.')
+    inception_classifier.export_saved_model(
+        export_dir_base=FLAGS.export_dir,
+        serving_input_receiver_fn=image_serving_input_fn)
+
 
 if __name__ == '__main__':
   tf.logging.set_verbosity(tf.logging.INFO)
-  tf.app.run()
+  app.run(main)

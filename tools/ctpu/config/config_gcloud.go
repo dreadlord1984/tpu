@@ -27,27 +27,36 @@ import (
 	"github.com/zieckey/goini"
 )
 
-// TODO(saeta): Add a GCE compatible environment.
-
 const appDefaultFile = "application_default_credentials.json"
 
 func gcloudConfig() (*Config, error) {
+	homedir := ""
+	if configDir, ok := os.LookupEnv("CLOUDSDK_CONFIG"); ok {
+		return buildGcloudEnvConfig(configDir, true)
+	}
 	user, err := user.Current()
 	if err != nil {
-		return nil, err
+		// Fallback to looking up in the environment as a final attempt.
+		var ok bool
+		homedir, ok = os.LookupEnv("HOME")
+		if !ok {
+			return nil, err
+		}
+	} else {
+		homedir = user.HomeDir
 	}
-	if len(user.HomeDir) == 0 {
+	if len(homedir) == 0 {
 		return nil, errors.New("could not find your home directory")
 	}
-	return buildGcloudEnvConfig(path.Join(user.HomeDir, ".config", "gcloud"))
+	return buildGcloudEnvConfig(path.Join(homedir, ".config", "gcloud"), true)
 }
 
-func buildGcloudEnvConfig(configDir string) (*Config, error) {
+func buildGcloudEnvConfig(configDir string, checkAppCredentials bool) (*Config, error) {
 	if stat, err := os.Stat(configDir); os.IsNotExist(err) || !stat.IsDir() {
 		return nil, fmt.Errorf("expected gcloud config directory at '%s'", configDir)
 	}
 
-	if err := checkAppDefaultFile(configDir); err != nil {
+	if err := checkAppDefaultFile(configDir); err != nil && checkAppCredentials {
 		return nil, err
 	}
 

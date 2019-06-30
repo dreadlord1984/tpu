@@ -16,11 +16,12 @@
 package commands
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
 
-	"context"
 	"flag"
 	"github.com/fatih/color"
 	"github.com/google/subcommands"
@@ -37,7 +38,7 @@ type UpTPUCP interface {
 	// OptionallyRetrieveInstance retrieves the instance, but can optionally not enable the TPU API.
 	OptionallyRetrieveInstance(bool) (*ctrl.TPUInstance, bool, error)
 	// CreateInstance requests the creation of the instance.
-	CreateInstance(ctx context.Context, version string, preemptible bool, hardwareType string) (ctrl.LongRunningOperation, error)
+	CreateInstance(ctx context.Context, version string, preemptible, reserved bool, hardwareType, network string) (ctrl.LongRunningOperation, error)
 	// ListVersions retrieves the list of available TensorFlow versions.
 	ListVersions() ([]*tpu.TensorFlowVersion, error)
 }
@@ -58,6 +59,11 @@ type UpGCECP interface {
 type UpResourceManagementCP interface {
 	// AddTPUUserAgent authorizes the TPU user agent, if required.
 	AddTPUUserAgent(tpuUserAgent string) error
+
+	// IsProjectInGoogleOrg determines if the project is part of the Google organziation.
+	//
+	// This is used to provide more helpful error messages
+	IsProjectInGoogleOrg() (bool, error)
 }
 
 // UpGcloudCLI abstracts the interaction with the gcloud command line tools for the up command.
@@ -82,18 +88,23 @@ type upCmd struct {
 	printWelcome     bool
 	dryRun           bool
 	vmOnly           bool
+	tpuOnly          bool
 	forwardPorts     bool
 	forwardAgent     bool
 	tfVersion        string
+	requirePerms     bool
+	network          string
 
 	// VM parameters
 	gceImage      string
+	dlImage       bool // Use the Deep Learning VM images instead of the TPU specific ones.
 	diskSizeGb    int64
 	machineType   string
 	preemptibleVM bool
 
 	// TPU parameters
 	preemptibleTPU bool
+	reservedTPU    bool
 	tpuHardware    string
 }
 
@@ -120,21 +131,28 @@ func (c *upCmd) SetFlags(f *flag.FlagSet) {
 		"Do not make changes; print only what would have happened.")
 	f.BoolVar(&c.vmOnly, "vm-only", false,
 		"Do not allocate a TPU, only allocate a VM (useful if you're not ready to run on a TPU yet).")
+	f.BoolVar(&c.tpuOnly, "tpu-only", false,
+		"Do not allocate a VM, only allocate a TPU (useful if you already have a VM ready).")
 	f.BoolVar(&c.forwardPorts, "forward-ports", true,
 		"Automatically forward useful ports from the Compute Engine VM to your local machine. The ports forwarded are: 6006 (tensorboard), 8888 (jupyter notebooks), 8470 (TPU port), 8466 (TPU profiler port).")
 	f.BoolVar(&c.forwardAgent, "forward-agent", true,
 		"Enable ssh agent forwarding when sshing into the Compute Engine VM. (SSH Agent Forwarding enables access to shared repositories (e.g. github) without having to place private keys on the Compute Engine VM.)")
 	f.StringVar(&c.tfVersion, "tf-version", "",
 		"Set the version of TensorFlow to use when creating the Compute Engine VM and the Cloud TPU. (It defaults to auto-selecting the latest stable release.)")
+	// Note: because some users won't be OWNERS of their projects, and because bucket-level permissions can be used, default is set to not require permissions.
+	f.BoolVar(&c.requirePerms, "require-permissions", false, "Stop the TPU setup if modification of Cloud IAM permissions fails. By default, ctpu prints a warning message then continues with the setup.")
 
 	f.StringVar(&c.gceImage, "gce-image", "",
 		"Override the automatically chosen Compute Engine Image. Use this flag when you're using your own custom images instead of the provided ones with TensorFlow pre-installed.")
+	f.BoolVar(&c.dlImage, "use-dl-images", false, "Use Deep Learning VM Images (see docs: https://cloud.google.com/deep-learning-vm/) instead of TPU-specific machine images. Defaults to TPU-specific images.")
 	f.Int64Var(&c.diskSizeGb, "disk-size-gb", 250, "Configures the root volume size of your Compute Engine VM.")
 	f.StringVar(&c.machineType, "machine-type", "n1-standard-2", "Configures the size of your Compute Engine VM.")
 	f.BoolVar(&c.preemptibleVM, "preemptible-vm", false, "Create a preemptible Compute Engine VM, instead of a normal (non-preemptible) VM. A preemptible VM costs less per hour, but the Compute Engine service can terminate the instance at any time.")
 
 	f.BoolVar(&c.preemptibleTPU, "preemptible", false, "Create a preemptible Cloud TPU, instead of a normal (non-preemptible) Cloud TPU. A preemptible Cloud TPU costs less per hour, but the Cloud TPU service can stop/terminate the node at any time.")
-	f.StringVar(&c.tpuHardware, "tpu-size", "v2-8", "Configure the size and generation of the Cloud TPU.")
+	f.BoolVar(&c.reservedTPU, "reserved", false, "Create a reserved Cloud TPU, instead of a on demand Cloud TPU. Reserved Cloud TPU's are available on a contract basis, currently available for TPU Pod's.")
+	f.StringVar(&c.tpuHardware, "tpu-size", "v2-8", "Configure the size and hardware version of the Cloud TPU. To see the list of available TPU hardware sizes, run `ctpu tpu-sizes`.")
+	f.StringVar(&c.network, "gcp-network", "default", "Specify the network the Cloud TPU and associated VM should be created in.")
 }
 
 func (upCmd) Synopsis() string {
@@ -160,6 +178,9 @@ func (c *upCmd) gceImageFamily() (string, error) {
 	if parsed.Modifier != "" {
 		return "", fmt.Errorf("invalid tensorflow version %q (non-empty modifier); please set the --gce-image flag", c.tfVersion)
 	}
+	if c.dlImage {
+		return fmt.Sprintf("tf-%d-%d-gpu", parsed.Major, parsed.Minor), nil
+	}
 	return fmt.Sprintf("tf-%d-%d", parsed.Major, parsed.Minor), nil
 }
 
@@ -174,12 +195,45 @@ version, and start a Compute Engine VM with a compatible version of TensorFlow
 pre-installed. When everything is ready, ctpu will automatically open an ssh
 connection to your new VM and port-forward commonly used ports. For more
 details, see the documentation at:
-      https://github.com/tensorflow/tpu/tools/ctpu
+      https://github.com/tensorflow/tpu/tree/master/tools/ctpu
 
 `)
 }
 
+var fullGCEImageRegex = regexp.MustCompile("https://www.googleapis.com/compute/v1/projects/[^/]+/global/images/[^/]+")
+
+func (c *upCmd) canonicalizeGCEImage() error {
+	if c.gceImage == "" {
+		return nil
+	}
+
+	if fullGCEImageRegex.MatchString(c.gceImage) {
+		return nil
+	}
+
+	splits := strings.Split(c.gceImage, "/")
+	if len(splits) > 2 {
+		return fmt.Errorf("invalid GCE Image specified (%q); must be either (1) a fully specified URL, (2) \"image_name\", or (3) \"project_Name/image_name\"", c.gceImage)
+	}
+
+	var imageName, projectName string
+	if len(splits) == 1 {
+		imageName = splits[0]
+		projectName = c.cfg.Project
+	}
+	if len(splits) == 2 {
+		imageName = splits[1]
+		projectName = splits[0]
+	}
+	c.gceImage = fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/global/images/%s", projectName, imageName)
+
+	return nil
+}
+
 func (c *upCmd) upVM() error {
+	if c.tpuOnly {
+		return nil
+	}
 	// Create the Compute Engine VM
 	vm, err := c.gce.Instance()
 	if err != nil {
@@ -200,6 +254,8 @@ func (c *upCmd) upVM() error {
 				ImageName:         c.gceImage,
 				MachineType:       c.machineType,
 				DiskSizeGb:        c.diskSizeGb,
+				Preemptible:       c.preemptibleVM,
+				Network:           c.network,
 			}
 			op, err := c.gce.CreateInstance(req)
 			if err != nil {
@@ -252,7 +308,7 @@ func (c *upCmd) upTPU(ctx context.Context) (*ctrl.TPUInstance, error) {
 	if tpu == nil {
 		log.Printf("Creating TPU %s (this may take a few minutes)...\n", c.cfg.FlockName)
 		if !c.dryRun {
-			op, err := c.tpu.CreateInstance(ctx, c.tfVersion, c.preemptibleTPU, c.tpuHardware)
+			op, err := c.tpu.CreateInstance(ctx, c.tfVersion, c.preemptibleTPU, c.reservedTPU, c.tpuHardware, c.network)
 			if err != nil {
 				log.Print(err)
 				return nil, err
@@ -278,8 +334,12 @@ func (c *upCmd) upTPU(ctx context.Context) (*ctrl.TPUInstance, error) {
 		}
 		err = c.rmg.AddTPUUserAgent(tpu.ServiceAccount)
 		if err != nil {
-			log.Printf("error adding the TPU's service account to the project's access control lists: %#v", err)
-			return nil, err
+			if c.requirePerms {
+				// Error out.
+				log.Printf("Error adding the TPU's service account to the project's access control lists: %#v", err)
+				return nil, err
+			}
+			log.Print("Warning: ctpu encountered an error when adding the TPU's service account to your project's access control lists. Some integrations (for example: Cloud Storage) may fail until you (or your GCP project's owner) adds appropriate permissions (see: https://cloud.google.com/tpu/docs/storage-buckets#storage_access). Pass --require-permissions to turn this warning into an error and get a more detailed error message.")
 		}
 	} else if !tpu.IsRunning() {
 		err := fmt.Errorf("the TPU exists, but is not running... aborting")
@@ -367,7 +427,8 @@ func (c *upCmd) confirmExecution(tpuAPIEnabled bool) (bool, error) {
 		fmt.Printf(`  Cloud TPU:
       Size:             %s
       Preemptible:      %v
-`, c.tpuHardware, c.preemptibleTPU)
+      Reserved:         %v
+`, c.tpuHardware, c.preemptibleTPU, c.reservedTPU)
 	}
 	fmt.Println()
 	return askForConfirmation("OK to create your Cloud TPU resources with the above configuration?")
@@ -439,6 +500,16 @@ execution. For the full list of flags, run: ctpu help up
 	if err != nil {
 		fmt.Printf("%v\n", err)
 		return subcommands.ExitFailure
+	}
+
+	// Do not attempt to ssh, as no instance was started.
+	if c.tpuOnly {
+		fmt.Println("Operation success; not ssh-ing to GCE VM due to --tpu-only flag.")
+		return subcommands.ExitSuccess
+	}
+
+	if inOrg, err := c.rmg.IsProjectInGoogleOrg(); err == nil && inOrg && c.cfg.Environment == "devshell" {
+		color.Red("WARNING: Attempting to ssh from Cloud Shell in Google org; this might not work!")
 	}
 
 	if c.forwardPorts {

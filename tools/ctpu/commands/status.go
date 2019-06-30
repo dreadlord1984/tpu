@@ -16,12 +16,13 @@
 package commands
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strings"
 	"sync"
+	"time"
 
-	"context"
 	"flag"
 	"github.com/fatih/color"
 	"github.com/google/subcommands"
@@ -31,14 +32,14 @@ import (
 
 // StatusTPUCP encapsulates the control plane interfaces required to execute the Status command.
 type StatusTPUCP interface {
-	// Instance retrieves the TPU instance (if available).
-	Instance() (*ctrl.TPUInstance, error)
+	// OptionallyRetrieveInstance retrieves the instance, but can optionally not enable the TPU API.
+	OptionallyRetrieveInstance(bool) (*ctrl.TPUInstance, bool, error)
 }
 
 // StatusGCECP encapsulates the control plane interfaces required to execute the Status command.
 type StatusGCECP interface {
-	// Instance retrieves the Compute Engine instance (if available).
-	Instance() (*ctrl.GCEInstance, error)
+	// OptionallyRetrieveInstance retrieves the instance, but can optionally not enable the TPU API.
+	OptionallyRetrieveInstance(bool) (*ctrl.GCEInstance, bool, error)
 }
 
 type statusCmd struct {
@@ -114,6 +115,27 @@ func (s *statusCmd) vmStatus(vm *ctrl.GCEInstance) string {
 	return s.runnableStatus(exists, isRunning, status)
 }
 
+func (s *statusCmd) timeDelta(t time.Time) string {
+	delta := time.Since(t).Round(time.Minute)
+	if delta < 0 {
+		return "--"
+	}
+	if delta.Minutes() < 1 {
+		return "< 1 minute"
+	}
+	minutes := (delta / time.Minute) % 60
+	hours := delta / time.Hour
+	days := delta / (time.Hour * 24)
+
+	if days > 3 {
+		return fmt.Sprintf("%dd %dh", days, hours%24)
+	}
+	if hours == 0 {
+		return fmt.Sprintf("%dm", minutes)
+	}
+	return fmt.Sprintf("%dh %dm", hours, minutes)
+}
+
 func (s *statusCmd) flockStatus(vm *ctrl.GCEInstance, tpu *ctrl.TPUInstance) string {
 	if vm == nil && tpu == nil {
 		return color.BlueString("No instances currently exist.")
@@ -150,13 +172,14 @@ func (s *statusCmd) Execute(ctx context.Context, flags *flag.FlagSet, args ...in
 
 	var vm *ctrl.GCEInstance
 	var tpu *ctrl.TPUInstance
+	var gceEnabled, tpuEnabled bool
 	var exitTPU, exitVM subcommands.ExitStatus
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		var err error
-		vm, err = s.gce.Instance()
+		vm, gceEnabled, err = s.gce.OptionallyRetrieveInstance(false)
 		if err != nil {
 			log.Print(err)
 			exitVM = subcommands.ExitFailure
@@ -166,7 +189,7 @@ func (s *statusCmd) Execute(ctx context.Context, flags *flag.FlagSet, args ...in
 
 	go func() {
 		var err error
-		tpu, err = s.tpu.Instance()
+		tpu, tpuEnabled, err = s.tpu.OptionallyRetrieveInstance(false)
 		if err != nil {
 			log.Print(err)
 			exitTPU = subcommands.ExitFailure
@@ -182,24 +205,37 @@ func (s *statusCmd) Execute(ctx context.Context, flags *flag.FlagSet, args ...in
 		return exitVM
 	}
 
+	if !gceEnabled || !tpuEnabled {
+		if !gceEnabled && !tpuEnabled {
+			fmt.Println("Neither the Compute Engine nor the Cloud TPU services have been enabled.")
+		} else if !gceEnabled {
+			fmt.Println("The Compute Engine service has not been enabled.")
+		} else {
+			fmt.Println("The Cloud TPU service has not been enabled.")
+		}
+		return subcommands.ExitFailure
+	}
+
 	fmt.Printf(`%s
 	Compute Engine VM:  %s
 	Cloud TPU:          %s
 `, s.flockStatus(vm, tpu), s.vmStatus(vm), s.tpuStatus(tpu))
 
-	vmIP, vmCreated, machineType := "--", "--", "--"
+	vmIP, vmCreated, vmCreateDelta, machineType := "--", "--", "--", "--"
 	if vm != nil {
 		if len(vm.NetworkInterfaces) > 0 {
 			vmIP = vm.NetworkInterfaces[0].NetworkIP
 		}
-		// TODO(saeta): Print delta between now and creation time.
 		vmCreated = vm.CreationTimestamp
+		if createTime, err := time.Parse(time.RFC3339, vmCreated); err == nil {
+			vmCreateDelta = s.timeDelta(createTime)
+		}
 
 		machineTypeParts := strings.Split(vm.MachineType, "/")
 		machineType = machineTypeParts[len(machineTypeParts)-1]
 	}
 
-	tpuType, tpuIP, tpuVer, tpuSA, tpuCreated, tpuState, tpuHealth, tpuPreemptible := "--", "--", "--", "--", "--", "--", "--", "--"
+	tpuType, tpuIP, tpuVer, tpuSA, tpuCreated, tpuCreateDelta, tpuState, tpuHealth, tpuPreemptible := "--", "--", "--", "--", "--", "--", "--", "--", "--"
 	if tpu != nil {
 		tpuType = tpu.AcceleratorType
 		if len(tpu.NetworkEndpoints) > 0 {
@@ -207,8 +243,10 @@ func (s *statusCmd) Execute(ctx context.Context, flags *flag.FlagSet, args ...in
 		}
 		tpuVer = tpu.TensorflowVersion
 		tpuSA = tpu.ServiceAccount
-		// TODO(saeta): Print delta between now and creation time.
 		tpuCreated = tpu.CreateTime
+		if createTime, err := time.Parse(time.RFC3339Nano, tpuCreated); err == nil {
+			tpuCreateDelta = s.timeDelta(createTime)
+		}
 		tpuState = tpu.State
 		tpuHealth = tpu.Health
 		tpuPreemptible = fmt.Sprintf("%v", tpu.IsPreemptible())
@@ -217,17 +255,17 @@ func (s *statusCmd) Execute(ctx context.Context, flags *flag.FlagSet, args ...in
 	if s.details {
 		fmt.Printf(`
 Compute Engine IP Address:    %s
-Compute Engine Created:       %s
+Compute Engine Created:       %s ago (@: %s)
 Compute Engine Machine Type:  %s
 TPU Accelerator Type:         %s
 TPU IP Address:               %s
 TPU TF Version:               %s
 TPU Service Acct:             %s
-TPU Created:                  %s
+TPU Created:                  %s ago (@: %s)
 TPU State:                    %s
 TPU Health:                   %s
 TPU Preemptible:              %s
-`, vmIP, vmCreated, machineType, tpuType, tpuIP, tpuVer, tpuSA, tpuCreated, tpuState, tpuHealth, tpuPreemptible)
+`, vmIP, vmCreateDelta, vmCreated, machineType, tpuType, tpuIP, tpuVer, tpuSA, tpuCreateDelta, tpuCreated, tpuState, tpuHealth, tpuPreemptible)
 	}
 	return subcommands.ExitSuccess
 }

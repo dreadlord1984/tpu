@@ -16,11 +16,11 @@
 package commands
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"testing"
 
-	"context"
 	"github.com/google/go-cmp/cmp"
 	"github.com/tensorflow/tpu/tools/ctpu/config"
 	"github.com/tensorflow/tpu/tools/ctpu/ctrl"
@@ -172,7 +172,7 @@ func (cp *testTPUCP) ListLocations() ([]*tpu.Location, error) {
 	return cp.tpuLocations, nil
 }
 
-func (cp *testTPUCP) CreateInstance(ctx context.Context, version string, preemptible bool, hardwareType string) (ctrl.LongRunningOperation, error) {
+func (cp *testTPUCP) CreateInstance(ctx context.Context, version string, preemptible, reserved bool, hardwareType, network string) (ctrl.LongRunningOperation, error) {
 	cp.OperationsPerformed = append(cp.OperationsPerformed, fmt.Sprintf("CREATE-%s", version))
 	cp.instance = cp.postCreateInstance
 	cp.postCreateInstance = nil
@@ -226,6 +226,10 @@ func (t *testResourceManagementCP) AddTPUUserAgent(tpuUserAgent string) error {
 	t.callCount++
 	t.serviceAccount = tpuUserAgent
 	return nil
+}
+
+func (t *testResourceManagementCP) IsProjectInGoogleOrg() (bool, error) {
+	return false, nil
 }
 
 // verifySingleOperation is a helper used to test the operations the commands perform.

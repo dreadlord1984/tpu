@@ -17,19 +17,19 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 
 	"flag"
 	// context is used to cancel outstanding requests
-	"context"
 	"github.com/google/subcommands"
 	"github.com/tensorflow/tpu/tools/ctpu/commands"
 	"github.com/tensorflow/tpu/tools/ctpu/config"
 	"github.com/tensorflow/tpu/tools/ctpu/ctrl"
 )
 
-const version = "1.3"
+const version = "1.11"
 
 var logRequests bool
 
@@ -67,12 +67,14 @@ func main() {
 	subcommands.Register(commands.StatusCommand(cfg, ctrls.TPU, ctrls.GCE), "")
 	subcommands.Register(commands.RestartCommand(cfg, ctrls.TPU), "")
 
+	subcommands.Register(commands.AuthCommand(cfg, ctrls.ResourceManagement), "configuration")
 	subcommands.Register(commands.ConfigCommand(cfg, ctrls.CLI), "configuration")
 	subcommands.Register(commands.VersionCommand(version), "configuration")
 	subcommands.Register(commands.ListCommand(cfg, ctrls.TPU, ctrls.GCE), "configuration")
 	subcommands.Register(commands.TFVersionsCommand(cfg, ctrls.TPU), "configuration")
 	subcommands.Register(commands.TPULocationsCommand(cfg, ctrls.TPU), "configuration")
 	subcommands.Register(commands.QuotaCommand(cfg), "configuration")
+	subcommands.Register(commands.TPUSizeCommand(cfg, ctrls.TPU), "configuration")
 
 	subcommands.Register(commands.PauseCommandAlias(cfg, ctrls.TPU, ctrls.GCE), "aliases for other commands")
 	subcommands.Register(commands.DeleteCommandAlias(cfg, ctrls.TPU, ctrls.GCE), "aliases for other commands")
